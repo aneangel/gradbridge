@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gradbridge"
+version = "0.1.0"
+description = "Gradients that cross framework boundaries: PyTorch, JAX, TensorFlow, NVIDIA Warp and NumPy."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Anthony Angeles" }]
+dependencies = ["numpy>=1.24"]
+keywords = ["autodiff", "gradients", "pytorch", "jax", "tensorflow", "warp", "interop", "dlpack"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Science/Research",
+]
+
+[project.urls]
+Repository = "https://github.com/aneangel/gradbridge"
+Issues = "https://github.com/aneangel/gradbridge/issues"
+Benchmarks = "https://github.com/aneangel/gradbridge/blob/main/benchmarks/RESULTS.md"
+
+[project.optional-dependencies]
+torch = ["torch>=2.4"]
+jax = ["jax>=0.4.31"]
+tf = ["tensorflow>=2.15"]
+warp = ["warp-lang>=1.5"]
+all = ["torch>=2.4", "jax>=0.4.31", "tensorflow>=2.15", "warp-lang>=1.5"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Compiled on first use against the installed TensorFlow (see gradbridge/_tf_native.py).
+gradbridge = ["_tf_op.cc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]

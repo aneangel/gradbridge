@@ -1,0 +1,457 @@
+"""PyTorch adapter.
+
+``from_torch`` turns a PyTorch function into a DiffFunction whose derivative
+rules are built with ``torch.autograd.grad(create_graph=True)``, so any order
+of reverse-mode derivative is available.
+
+``to_torch`` exposes any DiffFunction as a ``torch.library.custom_op`` (with a
+fake-tensor kernel and vmap rule) wrapped in a ``torch.autograd.Function``
+(with ``setup_context`` and a generated vmap rule). That makes it work with
+``loss.backward()``, double backward (``create_graph=True``), ``torch.func.grad``
+/ ``torch.func.vmap`` and ``torch.compile(fullgraph=True)``.
+"""
+
+from __future__ import annotations
+
+import functools
+import importlib.util
+import itertools
+import re
+import sys
+from typing import Callable, Optional
+
+import numpy as np
+
+# torch.library custom ops lazily import torch._dynamo, which loads Triton's
+# bundled LLVM. If TensorFlow (which bundles its own LLVM) is already loaded,
+# that import aborts the whole process. Load it now, or fail with an
+# explanation instead of a crash.
+if (
+    "tensorflow" in sys.modules
+    and "torch._dynamo" not in sys.modules
+    and importlib.util.find_spec("triton") is not None
+):
+    raise ImportError(
+        "gradbridge.torch must be imported before TensorFlow when Triton is installed: "
+        "TensorFlow and Triton bundle conflicting LLVM builds and the process would abort. "
+        "Import gradbridge.torch (or torch._dynamo) first, then tensorflow."
+    )
+
+import torch
+import torch._dynamo  # noqa: F401  (see note above)
+
+from . import _convert
+from ._core import DiffFunction, MaxOrderError, Spec, _as_tuple, as_diff_function, infer_n_inputs, split_primals
+
+__all__ = ["from_torch", "to_torch"]
+
+_op_counter = itertools.count()
+
+
+# =============================================================================
+# Source: PyTorch function -> DiffFunction
+# =============================================================================
+# Custom-op bodies run *below* PyTorch's autograd layer (autograd dispatch keys
+# are excluded), so a PyTorch source called from inside one -- directly, or via
+# a JAX/TF callback -- could not record a graph. Snapshot the normal dispatch
+# state at import time and restore it while a PyTorch source differentiates.
+_DEFAULT_INCLUDE = torch._C._dispatch_tls_local_include_set()
+_DEFAULT_EXCLUDE = torch._C._dispatch_tls_local_exclude_set()
+
+
+class _autograd_on:
+    def __enter__(self):
+        self._force = torch._C._ForceDispatchKeyGuard(_DEFAULT_INCLUDE, _DEFAULT_EXCLUDE)
+        self._force.__enter__()
+        self._grad = torch.enable_grad()
+        self._grad.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._grad.__exit__(*exc)
+        self._force.__exit__(*exc)
+        return False
+
+
+def _leaf(x: torch.Tensor) -> torch.Tensor:
+    """Make ``x`` something we can differentiate with respect to, without
+    detaching it from an enclosing graph (needed for higher-order derivatives)."""
+    if not (x.is_floating_point() or x.is_complex()):
+        return x
+    if x.requires_grad:
+        return x
+    return x.detach().requires_grad_(True)
+
+
+def _grads(outs, xs, cts, *, create_graph: bool):
+    """VJP of ``outs`` w.r.t. ``xs`` with cotangents ``cts``; zeros where unused."""
+    idx = [i for i, x in enumerate(xs) if x.requires_grad]
+    pairs = [(o, c) for o, c in zip(outs, cts) if isinstance(o, torch.Tensor) and o.requires_grad]
+    result = [torch.zeros_like(x) for x in xs]
+    if idx and pairs:
+        g = torch.autograd.grad(
+            [o for o, _ in pairs],
+            [xs[i] for i in idx],
+            [c.to(dtype=o.dtype, device=o.device) for o, c in pairs],
+            create_graph=create_graph,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        for i, gi in zip(idx, g):
+            if gi is not None:
+                result[i] = gi
+    return tuple(result)
+
+
+def _make(fn_t: Callable, *, name, framework="torch", n_inputs=None, n_outputs=None, batched=False, device=None):
+    def to_t(x):
+        return _convert.to_torch(x, device=device)
+
+    def _eval(*xs):
+        with torch.no_grad():
+            return tuple(o.detach() if isinstance(o, torch.Tensor) else o for o in _as_tuple(fn_t(*[to_t(x) for x in xs])))
+
+    def _fwd(*xs):
+        # Fresh leaves: the residual path is first-order only, so never attach
+        # to the caller's graph.
+        with _autograd_on():
+            txs = [_leaf(to_t(x).detach()) for x in xs]
+            outs = _as_tuple(fn_t(*txs))
+        return tuple(o.detach() for o in outs), (txs, outs)
+
+    def _bwd(res, *cts):
+        txs, outs = res
+        with _autograd_on():
+            return _grads(outs, txs, [to_t(c) for c in cts], create_graph=False)
+
+    def _spec(*specs):
+        try:
+            metas = [torch.empty(s.shape, dtype=_convert.torch_dtype(s.dtype), device="meta") for s in specs]
+            with torch.no_grad():
+                outs = _as_tuple(fn_t(*metas))
+            return tuple(Spec(tuple(o.shape), _convert.numpy_dtype_from_torch(o.dtype)) for o in outs)
+        except Exception:
+            outs = _eval(*[s.zeros() for s in specs])
+            return tuple(Spec(tuple(o.shape), _convert.numpy_dtype_from_torch(o.dtype)) for o in outs)
+
+    dfn = DiffFunction(
+        _eval,
+        spec=_spec,
+        fwd=_fwd,
+        bwd=_bwd,
+        batched=batched,
+        framework=framework,
+        name=name,
+        n_inputs=n_inputs,
+        n_outputs=n_outputs,
+    )
+
+    def vjp_body(*args):
+        xs, cts = split_primals(dfn, args)
+        with _autograd_on():
+            txs = [_leaf(to_t(x)) for x in xs]
+            tcts = [to_t(c) for c in cts]
+            outs = _as_tuple(fn_t(*txs))
+            return _grads(outs, txs, tcts, create_graph=True)
+
+    def jvp_body(*args):
+        k = len(args) // 2
+        xs = tuple(to_t(x) for x in args[:k])
+        ts = tuple(to_t(t).to(x.dtype) for x, t in zip(xs, args[k:]))
+        with _autograd_on():
+            _, tangents_out = torch.func.jvp(lambda *a: _as_tuple(fn_t(*a)), xs, ts)
+        return tangents_out
+
+    dfn._vjp_factory = lambda: _make(
+        vjp_body, name=f"{name}_vjp", framework=framework, n_outputs=dfn.n_inputs, device=device
+    )
+    dfn._jvp_factory = lambda: _make(jvp_body, name=f"{name}_jvp", framework=framework, device=device)
+    return dfn
+
+
+def from_torch(
+    fn: Callable,
+    *,
+    batched: bool = False,
+    n_inputs: Optional[int] = None,
+    name: Optional[str] = None,
+    device=None,
+) -> DiffFunction:
+    """Wrap a PyTorch function ``fn(*tensors) -> tensor | tuple``.
+
+    Gradients of any order come from PyTorch's own autograd. ``device`` moves
+    incoming arrays to a torch device (e.g. ``"cuda"``) before calling ``fn``.
+    """
+    dfn = _make(
+        fn,
+        name=name or getattr(fn, "__name__", "torch_fn"),
+        n_inputs=infer_n_inputs(fn, n_inputs),
+        batched=batched,
+        device=device,
+    )
+    if device is None:
+        dfn._torch_native = fn
+    return dfn
+
+
+# =============================================================================
+# Consumer: DiffFunction -> PyTorch op
+# =============================================================================
+def _spec_of(x: torch.Tensor) -> Spec:
+    return Spec(tuple(int(d) for d in x.shape), _convert.numpy_dtype_from_torch(x.dtype))
+
+
+def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+    try:
+        return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr() and a.numel() > 0
+    except Exception:
+        return False
+
+
+def _sanitize(name: str) -> str:
+    s = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+    return s if s and not s[0].isdigit() else f"f_{s}"
+
+
+def _custom_op(dfn: DiffFunction):
+    cache = dfn._consumer_cache
+    if "torch_op" in cache:
+        return cache["torch_op"]
+
+    opname = f"gradbridge::{_sanitize(dfn.name)}_{next(_op_counter)}"
+
+    @torch.library.custom_op(opname, mutates_args=())
+    def op(xs: list[torch.Tensor]) -> list[torch.Tensor]:
+        device = xs[0].device if xs else torch.device("cpu")
+        outs = dfn.eval(*xs)
+        specs = dfn.spec(*[_spec_of(x) for x in xs])
+        result = []
+        for o, s in zip(outs, specs):
+            t = _convert.to_torch(o, device=device, dtype=_convert.torch_dtype(s.dtype))
+            if any(_shares_storage(t, x) for x in xs):
+                t = t.clone()
+            result.append(t.contiguous())
+        return result
+
+    @op.register_fake
+    def _(xs):
+        device = xs[0].device if xs else torch.device("cpu")
+        specs = dfn.spec(*[_spec_of(x) for x in xs])
+        return [torch.empty(s.shape, dtype=_convert.torch_dtype(s.dtype), device=device) for s in specs]
+
+
+    def setup_context(ctx, inputs, output):
+        (xs,) = inputs
+        ctx.save_for_backward(*xs)
+        ctx.out_meta = [(tuple(o.shape), o.dtype, o.device) for o in output]
+
+    def backward(ctx, grads):
+        xs = ctx.saved_tensors
+        cts = [
+            g if g is not None else torch.zeros(shape, dtype=dtype, device=device)
+            for g, (shape, dtype, device) in zip(grads, ctx.out_meta)
+        ]
+        in_cts = _custom_op(dfn.vjp_function)(list(xs) + list(cts))
+        return [
+            ct.to(x.dtype) if (x.is_floating_point() or x.is_complex()) else None
+            for ct, x in zip(in_cts, xs)
+        ]
+
+    op.register_autograd(backward, setup_context=setup_context)
+
+    def vmap_rule(info, in_dims, xs):
+        dims = in_dims[0]
+        B = info.batch_size
+        if dfn.batched:
+            xb = [
+                x.movedim(d, 0) if d is not None else x.unsqueeze(0).expand(B, *x.shape).contiguous()
+                for x, d in zip(xs, dims)
+            ]
+            outs = op(xb)
+            return outs, [0] * len(outs)
+        per = [op([x.select(d, b) if d is not None else x for x, d in zip(xs, dims)]) for b in range(B)]
+        outs = [torch.stack([p[j] for p in per]) for j in range(len(per[0]))]
+        return outs, [0] * len(outs)
+
+    torch.library.register_vmap(op, vmap_rule)
+    # Dynamo traces the registered OpOverload handle, not the CustomOpDef object.
+    op.overload = getattr(torch.ops.gradbridge, opname.split("::", 1)[1]).default
+    cache["torch_op"] = op
+    return op
+
+
+_BRIDGE_REGISTRY: dict = {}
+
+
+def _eager_vjp(key, xs, cts):
+    return _bridge(_BRIDGE_REGISTRY[key].vjp_function).apply(*xs, *cts)
+
+
+def _bridge(dfn: DiffFunction):
+    """autograd.Function around the custom op.
+
+    The custom op is the opaque compute (fake-tensor + vmap rules, so
+    torch.compile and vmap see through nothing). Differentiation lives here, in
+    an autograd.Function with ``setup_context`` and a generated vmap rule, which
+    is what ``torch.func.grad`` / ``vmap(grad(...))`` and double backward need.
+    """
+    cache = dfn._consumer_cache
+    if "torch_bridge" in cache:
+        return cache["torch_bridge"]
+    # The autograd.Function's methods must not close over Python objects Dynamo
+    # cannot wrap (like the DiffFunction): use an int key + module registry.
+    key = id(dfn)
+    _BRIDGE_REGISTRY[key] = dfn
+    name = dfn.name
+    overload = _custom_op(dfn).overload
+    # Pre-create the VJP op so a compiled backward can call it as an opaque op
+    # (Dynamo cannot trace the Python lookup of dfn.vjp_function).
+    vjp_overload = _custom_op(dfn.vjp_function).overload if dfn.has_vjp else None
+
+    class _Bridge(torch.autograd.Function):
+        generate_vmap_rule = True
+
+        @staticmethod
+        def forward(*xs):
+            return tuple(overload(list(xs)))
+
+        @staticmethod
+        def setup_context(ctx, inputs, output):
+            ctx.save_for_backward(*inputs)
+            ctx.out_meta = [(tuple(o.shape), o.dtype, o.device) for o in output]
+
+        @staticmethod
+        def backward(ctx, *grads):
+            xs = ctx.saved_tensors
+            cts = [
+                g if g is not None else torch.zeros(shape, dtype=dtype, device=device)
+                for g, (shape, dtype, device) in zip(grads, ctx.out_meta)
+            ]
+            if torch.compiler.is_compiling():
+                if vjp_overload is None:
+                    raise MaxOrderError(f"gradbridge: '{name}' has no reverse-mode rule")
+                in_cts = vjp_overload(list(xs) + list(cts))
+            else:
+                # Full path: supports torch.func transforms and double backward.
+                # Raises MaxOrderError past the source's limit (e.g. Warp at order 2).
+                in_cts = _eager_vjp(key, xs, cts)
+            return tuple(
+                c.to(x.dtype) if (x.is_floating_point() or x.is_complex()) else None for c, x in zip(in_cts, xs)
+            )
+
+    _Bridge.__name__ = f"Bridge_{_sanitize(name)}"
+    cache["torch_bridge"] = _Bridge
+    return _Bridge
+
+
+def _eager_function(dfn: DiffFunction, cache_residuals: bool):
+    """Eager fast path: an autograd.Function that calls the source directly.
+
+    Skips the custom-op dispatcher (needed only by torch.compile / torch.func). With
+    ``cache_residuals`` the forward keeps the source's residuals (its autograd graph,
+    ``jax.vjp`` pullback, Warp tape) for backward; otherwise backward recomputes them.
+    """
+    key = "torch_eager_cached" if cache_residuals else "torch_eager_recompute"
+    cache = dfn._consumer_cache
+    if key in cache:
+        return cache[key]
+
+    class _Eager(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, *xs):
+            device = xs[0].device if xs else torch.device("cpu")
+            if cache_residuals:
+                outs, ctx.res = dfn.fwd(*xs)
+            else:
+                outs, ctx.res = dfn.eval(*xs), None
+            ctx.save_for_backward(*xs)
+            out_t = []
+            for o in outs:
+                t = _convert.to_torch(o, device=device)
+                # Same rule as the custom op: never hand out an alias of an input.
+                if any(_shares_storage(t, x) for x in xs):
+                    t = t.clone()
+                out_t.append(t)
+            ctx.out_meta = [(tuple(o.shape), o.dtype, o.device) for o in out_t]
+            return tuple(out_t)
+
+        @staticmethod
+        def backward(ctx, *grads):
+            xs = ctx.saved_tensors
+            cts = [
+                g if g is not None else torch.zeros(shape, dtype=dtype, device=device)
+                for g, (shape, dtype, device) in zip(grads, ctx.out_meta)
+            ]
+            if torch.is_grad_enabled():
+                # create_graph=True: need a differentiable backward, use the op path.
+                in_cts = _bridge(dfn.vjp_function).apply(*xs, *cts)
+            else:
+                raw = dfn.bwd(ctx.res, *cts) if ctx.res is not None else dfn.vjp_function.eval(*xs, *cts)
+                in_cts = [_convert.to_torch(c, device=x.device) for c, x in zip(raw, xs)]
+            return tuple(
+                c.to(x.dtype) if (x.is_floating_point() or x.is_complex()) else None for c, x in zip(in_cts, xs)
+            )
+
+    _Eager.__name__ = f"Eager_{_sanitize(dfn.name)}"
+    cache[key] = _Eager
+    return _Eager
+
+
+def _eager_ok() -> bool:
+    """Plain eager execution: no torch.compile tracing and no torch.func transform active."""
+    if torch.compiler.is_compiling():
+        return False
+    return torch._C._functorch.peek_interpreter_stack() is None
+
+
+# Sources whose cached residuals stay valid until backward: PyTorch saved tensors carry version
+# counters, JAX and TensorFlow arrays are immutable, NumPy residuals are the inputs themselves.
+# Warp kernels write into caller-owned buffers, but from_warp tracks the memory every recorded
+# tape touched and recomputes a residual that a later Warp call may have overwritten.
+_SAFE_TO_CACHE = {"torch", "jax", "tensorflow", "numpy", "warp"}
+
+
+def to_torch(fn, *, cache_residuals: Optional[bool] = None) -> Callable:
+    """Expose any gradbridge function to PyTorch.
+
+    The result accepts tensors (or any arrays) and returns a tensor, or a tuple
+    for multiple outputs. Gradients flow through ``.backward()``.
+
+    In plain eager mode the call goes straight to the source; under
+    ``torch.compile`` or a ``torch.func`` transform it goes through a custom op
+    those systems can trace.
+
+    ``cache_residuals`` (eager mode only) controls whether the source's forward
+    state is kept for backward instead of recomputing the forward. The default,
+    ``None``, caches for every source. For Warp sources, gradbridge records the
+    memory each forward's kernels touched; if a later bridged Warp call touches
+    any of it before ``backward()`` (e.g. several rollouts of one simulator), the
+    earlier backward recomputes its forward first, so gradients stay exact. What
+    it cannot see is your own code writing into those buffers between forward and
+    backward -- pass ``False`` to always recompute if you do that.
+    """
+    dfn = as_diff_function(fn)
+    op = _custom_op(dfn)
+    bridge = _bridge(dfn)
+    cache = dfn.framework in _SAFE_TO_CACHE if cache_residuals is None else bool(cache_residuals)
+    eager = _eager_function(dfn, cache)
+
+    native = dfn._torch_native
+
+    def wrapper(*xs):
+        txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
+        if native is not None:
+            # A PyTorch source called from PyTorch needs no bridge: its own graph is the gradient.
+            outs = _as_tuple(native(*txs))
+        else:
+            outs = tuple((eager if _eager_ok() else bridge).apply(*txs))
+        return outs[0] if len(outs) == 1 else outs
+
+    functools.update_wrapper(wrapper, dfn._eval, assigned=("__doc__",), updated=())
+    wrapper.__name__ = dfn.name
+    wrapper.__gradbridge__ = lambda: dfn
+    wrapper.custom_op = op
+    return wrapper
+
+
+__all__ += ["MaxOrderError"]
