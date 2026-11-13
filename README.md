@@ -154,6 +154,9 @@ Second-order availability depends on the **source**:
 Other options:
 - A function called from its own framework (PyTorch from PyTorch, JAX from JAX, TensorFlow
   from TensorFlow, Warp from Warp) is composed natively: no bridge, native speed.
+- Tensors a PyTorch function captures (e.g. an `nn.Module`'s parameters) receive gradients
+  whichever framework drives the call, accumulated into `.grad` like `loss.backward()` — so a
+  PyTorch network inside a Warp, JAX or TensorFlow computation trains through it.
 - `gb.to_torch(f, cache_residuals=False)` recomputes the forward inside backward instead of
   keeping the source's residuals (the default keeps them; see Limitations for Warp).
 - `from_*(..., batched=True)` declares that a function accepts a leading batch dimension,

@@ -134,6 +134,9 @@ class DiffFunction:
         self._torch_native: Optional[Callable] = None
         self._warp_native: Optional[Callable] = None
         self._tf_native: Optional[Callable] = None
+        # True when evaluating this function has effects beyond its outputs (a PyTorch VJP
+        # accumulates into captured parameters' .grad): compilers must not drop or repeat it.
+        self.has_side_effects = False
         # Consumers (to_torch, to_jax, ...) cache their wrappers here.
         self._consumer_cache: dict = {}
 

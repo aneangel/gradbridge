@@ -5,17 +5,17 @@
 derivative order is available.
 
 ``to_jax`` exposes any DiffFunction to JAX via ``jax.custom_vjp`` around a
-``jax.pure_callback``. It works under ``jax.jit``, ``jax.vmap`` and nested
+callback into the foreign framework (see below). It works under ``jax.jit``, ``jax.vmap`` and nested
 ``jax.grad`` (reverse-over-reverse). With ``mode="jvp"`` it uses
 ``jax.custom_jvp`` instead, enabling forward mode (``jax.jvp``, ``jax.jacfwd``)
 but not reverse mode -- JAX cannot transpose an opaque callback.
 
-On CUDA (with Warp installed) the callback is an XLA FFI handler built with
-Warp's ``jax_callable``: the foreign function receives XLA's device buffers
-zero-copy, ordered on XLA's stream. A JAX source is composed directly, with no
-callback. Elsewhere -- CPU, natively batched sources, 0-d or >4-d arrays,
-dtypes Warp has no scalar type for -- ``jax.pure_callback`` is used, which
-copies device -> host -> device.
+With Warp installed, the callback is an XLA FFI handler built with Warp's
+``jax_callable`` (CPU and CUDA): the foreign function receives XLA's buffers
+zero-copy, ordered on XLA's stream on GPU. A JAX source is composed directly, with no
+callback. Otherwise -- no Warp, natively batched sources, 0-d or >4-d arrays,
+dtypes Warp has no scalar type for -- ``jax.pure_callback`` is used (or
+``io_callback`` for side-effecting VJPs), which copies device -> host -> device.
 """
 
 from __future__ import annotations
@@ -154,20 +154,27 @@ def _callback(dfn: DiffFunction, xs):
     vmap_method = "broadcast_all" if dfn.batched else "sequential"
 
     def host_call(*args):
+        if dfn.has_side_effects:
+            # io_callback: XLA may neither drop it (when its outputs are unused) nor repeat it.
+            from jax.experimental import io_callback
+
+            return io_callback(host, result_shapes, *args, ordered=False)
         return jax.pure_callback(host, result_shapes, *args, vmap_method=vmap_method)
 
+    # The FFI handler runs on CPU and CUDA alike, so no platform switch is needed (a lax switch
+    # would also make side-effecting VJPs fail under vmap: "IO effect not supported in vmap-of-cond").
     device_call = _gpu_callable(dfn, xs, result_shapes)
     if device_call is None:
         return host_call(*xs)
-    return tuple(jax.lax.platform_dependent(*xs, cuda=device_call, default=host_call))
+    return device_call(*xs)
 
 
 # =============================================================================
 # GPU-resident callbacks (XLA FFI through Warp's jax_callable)
 # =============================================================================
-# pure_callback always hands the callback host arrays. On CUDA, the call instead goes through an
-# XLA FFI handler (Warp's public jax_callable): the foreign function receives XLA's device buffers
-# zero-copy and runs ordered on XLA's stream, so GPU data never leaves the device.
+# pure_callback always hands the callback host arrays. The call instead goes through an XLA FFI
+# handler (Warp's public jax_callable), registered for CPU and CUDA: the foreign function receives
+# XLA's buffers zero-copy and, on GPU, runs ordered on XLA's stream, so data never leaves the device.
 def _warp_or_none():
     try:
         import warp as wp
@@ -199,7 +206,7 @@ def _gpu_callable(dfn: DiffFunction, xs, result_shapes):
     if not _ffi_compatible(ins + outs):
         return None
 
-    key = (tuple(ins), tuple(outs))
+    key = (tuple(ins), tuple(outs), dfn.has_side_effects)
     cache = dfn._consumer_cache.setdefault("jax_ffi", {})
     if key not in cache:
         cache[key] = _make_ffi_callable(wp, dfn, ins, outs)
@@ -223,7 +230,9 @@ def _make_ffi_callable(wp, dfn: DiffFunction, ins, outs):
             wp.copy(dst, src.reshape(dst.shape) if src.shape != dst.shape else src)
         # The results may be freed (and their memory reused by another framework's allocator on
         # its own stream) as soon as this returns; wait until XLA's stream has finished copying.
-        wp.synchronize_stream(wp.get_stream(out_arrays[0].device))
+        # (The handler also runs for CPU computations, e.g. arrays committed to a CPU device.)
+        if out_arrays[0].device.is_cuda:
+            wp.synchronize_stream(wp.get_stream(out_arrays[0].device))
 
     n_in, n_out = len(ins), len(outs)
     in_names = [f"x{i}" for i in range(n_in)]
@@ -240,7 +249,11 @@ def _make_ffi_callable(wp, dfn: DiffFunction, ins, outs):
     }
     fn.__qualname__ = fn.__name__ = f"gradbridge_{dfn.name}"
     ffi_fn = wp.jax_callable(
-        fn, num_outputs=n_out, graph_mode=wp.JaxCallableGraphMode.NONE, vmap_method="sequential"
+        fn,
+        num_outputs=n_out,
+        graph_mode=wp.JaxCallableGraphMode.NONE,
+        vmap_method="sequential",
+        has_side_effect=dfn.has_side_effects,  # never dropped as dead code, never repeated
     )
     output_dims = {name: shape for name, (shape, _) in zip(out_names, outs)}
     return ffi_fn, output_dims

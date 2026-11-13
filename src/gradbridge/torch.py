@@ -18,6 +18,7 @@ import importlib.util
 import itertools
 import re
 import sys
+import threading
 from typing import Callable, Optional
 
 import numpy as np
@@ -83,23 +84,78 @@ def _leaf(x: torch.Tensor) -> torch.Tensor:
     return x.detach().requires_grad_(True)
 
 
-def _grads(outs, xs, cts, *, create_graph: bool):
-    """VJP of ``outs`` w.r.t. ``xs`` with cotangents ``cts``; zeros where unused."""
+# Set while a function is evaluated only to infer output shapes: that dry run must not leave
+# gradients in captured parameters.
+_SHAPE_ONLY = threading.local()
+
+
+def _captured_leaves(outs, xs):
+    """Leaf tensors that require grad and that ``outs`` depend on, other than the inputs ``xs``:
+    typically an ``nn.Module``'s parameters captured by the wrapped function.
+
+    The graph walk stops at the inputs (and at their own graph nodes, for non-leaf inputs), so a
+    caller's graph upstream of the inputs is never reached.
+    """
+    inputs = {id(x) for x in xs}
+    stop = {id(x.grad_fn) for x in xs if isinstance(x, torch.Tensor) and x.grad_fn is not None}
+    stack = [o.grad_fn for o in outs if isinstance(o, torch.Tensor) and o.grad_fn is not None]
+    # Visited nodes are kept alive: graph nodes are transient Python wrappers, and a freed
+    # wrapper's id() can be reused by the next one, which would then be wrongly skipped.
+    seen, visited, leaves, leaf_ids = set(), [], [], set()
+    while stack:
+        node = stack.pop()
+        if node is None or id(node) in seen or id(node) in stop:
+            continue
+        seen.add(id(node))
+        visited.append(node)
+        var = getattr(node, "variable", None)  # AccumulateGrad nodes hold their leaf
+        if var is not None:
+            if id(var) not in inputs and id(var) not in leaf_ids:
+                leaf_ids.add(id(var))
+                leaves.append(var)
+            continue
+        stack.extend(nxt for nxt, _ in node.next_functions)
+    return leaves
+
+
+def _grads(outs, xs, cts, *, create_graph: bool, owned: bool = False):
+    """VJP of ``outs`` w.r.t. ``xs`` with cotangents ``cts``; zeros where unused.
+
+    Like ``backward()`` in PyTorch itself, it also accumulates into ``.grad`` of captured leaves
+    (e.g. a network's parameters), so they train when a non-PyTorch framework drives the call.
+    ``owned``: every input is a fresh leaf created by gradbridge, so ``torch.autograd.backward``
+    can accumulate into all leaves natively (no graph walk, no Python loop over parameters).
+    """
     idx = [i for i, x in enumerate(xs) if x.requires_grad]
     pairs = [(o, c) for o, c in zip(outs, cts) if isinstance(o, torch.Tensor) and o.requires_grad]
+    shape_only = getattr(_SHAPE_ONLY, "active", False)
+    if owned and not create_graph and not shape_only and pairs:
+        for x in xs:
+            x.grad = None  # residuals may be reused (retain_graph): start from zero
+        torch.autograd.backward(
+            [o for o, _ in pairs],
+            grad_tensors=[c.to(dtype=o.dtype, device=o.device) for o, c in pairs],
+            retain_graph=True,
+        )
+        return tuple(x.grad if x.grad is not None else torch.zeros_like(x) for x in xs)
     result = [torch.zeros_like(x) for x in xs]
-    if idx and pairs:
+    captured = _captured_leaves([o for o, _ in pairs], xs) if pairs and not shape_only else []
+    if (idx or captured) and pairs:
         g = torch.autograd.grad(
             [o for o, _ in pairs],
-            [xs[i] for i in idx],
+            [xs[i] for i in idx] + captured,
             [c.to(dtype=o.dtype, device=o.device) for o, c in pairs],
             create_graph=create_graph,
             retain_graph=True,
             allow_unused=True,
         )
-        for i, gi in zip(idx, g):
+        for i, gi in zip(idx, g[: len(idx)]):
             if gi is not None:
                 result[i] = gi
+        with torch.no_grad():
+            for leaf, gl in zip(captured, g[len(idx) :]):
+                if gl is not None:
+                    leaf.grad = gl.detach().clone() if leaf.grad is None else leaf.grad.add_(gl.detach())
     return tuple(result)
 
 
@@ -122,17 +178,37 @@ def _make(fn_t: Callable, *, name, framework="torch", n_inputs=None, n_outputs=N
     def _bwd(res, *cts):
         txs, outs = res
         with _autograd_on():
-            return _grads(outs, txs, [to_t(c) for c in cts], create_graph=False)
+            # txs are fresh leaves made by _fwd: PyTorch can accumulate into every leaf natively.
+            return _grads(outs, txs, [to_t(c) for c in cts], create_graph=False, owned=True)
 
     def _spec(*specs):
+        _SHAPE_ONLY.active = True
+        try:
+            return _infer_spec(*specs)
+        finally:
+            _SHAPE_ONLY.active = False
+
+    def _infer_spec(*specs):
         try:
             metas = [torch.empty(s.shape, dtype=_convert.torch_dtype(s.dtype), device="meta") for s in specs]
             with torch.no_grad():
                 outs = _as_tuple(fn_t(*metas))
             return tuple(Spec(tuple(o.shape), _convert.numpy_dtype_from_torch(o.dtype)) for o in outs)
         except Exception:
-            outs = _eval(*[s.zeros() for s in specs])
-            return tuple(Spec(tuple(o.shape), _convert.numpy_dtype_from_torch(o.dtype)) for o in outs)
+            # Meta tensors fail when the function captures real tensors (e.g. a CUDA module):
+            # evaluate on zeros, on the device those captured tensors most likely live on.
+            devices = [device] if device is not None else []
+            devices += (["cuda"] if torch.cuda.is_available() else []) + ["cpu"]
+            last = None
+            for dev in devices:
+                try:
+                    with torch.no_grad():
+                        zs = [torch.zeros(s.shape, dtype=_convert.torch_dtype(s.dtype), device=dev) for s in specs]
+                        outs = _as_tuple(fn_t(*zs))
+                    return tuple(Spec(tuple(o.shape), _convert.numpy_dtype_from_torch(o.dtype)) for o in outs)
+                except Exception as e:  # noqa: PERF203 - try the next device
+                    last = e
+            raise last
 
     dfn = DiffFunction(
         _eval,
@@ -148,11 +224,16 @@ def _make(fn_t: Callable, *, name, framework="torch", n_inputs=None, n_outputs=N
 
     def vjp_body(*args):
         xs, cts = split_primals(dfn, args)
+        # Grad mode on entry tells the callers apart: evaluated for a foreign consumer it is off
+        # (outputs are detached), inside the higher-order machinery it is on and a graph is needed.
+        need_graph = torch.is_grad_enabled()
         with _autograd_on():
-            txs = [_leaf(to_t(x)) for x in xs]
+            converted = [to_t(x) for x in xs]
+            txs = [_leaf(c) for c in converted]
+            owned = all(t is not c for t, c in zip(txs, converted) if t.requires_grad)
             tcts = [to_t(c) for c in cts]
             outs = _as_tuple(fn_t(*txs))
-            return _grads(outs, txs, tcts, create_graph=True)
+            return _grads(outs, txs, tcts, create_graph=need_graph, owned=owned)
 
     def jvp_body(*args):
         k = len(args) // 2
@@ -162,9 +243,12 @@ def _make(fn_t: Callable, *, name, framework="torch", n_inputs=None, n_outputs=N
             _, tangents_out = torch.func.jvp(lambda *a: _as_tuple(fn_t(*a)), xs, ts)
         return tangents_out
 
-    dfn._vjp_factory = lambda: _make(
-        vjp_body, name=f"{name}_vjp", framework=framework, n_outputs=dfn.n_inputs, device=device
-    )
+    def _vjp_factory():
+        vjp = _make(vjp_body, name=f"{name}_vjp", framework=framework, n_outputs=dfn.n_inputs, device=device)
+        vjp.has_side_effects = True  # accumulates into captured parameters' .grad
+        return vjp
+
+    dfn._vjp_factory = _vjp_factory
     dfn._jvp_factory = lambda: _make(jvp_body, name=f"{name}_jvp", framework=framework, device=device)
     return dfn
 

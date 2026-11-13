@@ -316,3 +316,129 @@ def test_touched_ranges_merges_views():
     assert covered(base.ptr, base.ptr + half) and covered(base.ptr + half, base.ptr + 2 * half), ranges
     assert covered(out.ptr, out.ptr + out.capacity), ranges
     assert len(ranges) <= 3, f"ranges were not merged: {ranges}"
+
+
+# ============================================================================= captured PyTorch parameters
+def _mlp():
+    torch.manual_seed(0)
+    return torch.nn.Sequential(
+        torch.nn.Linear(3, 8), torch.nn.Tanh(), torch.nn.Linear(8, 8), torch.nn.Tanh(), torch.nn.Linear(8, 2)
+    ).double()
+
+
+def _reference_param_grads(net, x):
+    net.zero_grad()
+    net(torch.tensor(x)).sum().backward()
+    return [p.grad.clone() for p in net.parameters()]
+
+
+def _run_consumer(consumer, f, x):
+    if consumer == "numpy":
+        f_np = gb.to_numpy(f)
+        f_np.vjp(x, cotangents=(np.ones((x.shape[0], 2)),))
+    elif consumer == "jax":
+        # Committed to the CPU like the network, also on machines whose default JAX device is a GPU.
+        xj = jax.device_put(x, jax.devices("cpu")[0])
+        jax.grad(lambda a: jnp.sum(gb.to_jax(f)(a)))(xj)
+    elif consumer == "tf":
+        with tf.device("/CPU:0"):
+            tx = tf.constant(x)
+            with tf.GradientTape() as tape:
+                tape.watch(tx)
+                out = gb.to_tf(f)(tx)
+            tape.gradient(out, tx)
+    else:
+        wx = wp.array(x, dtype=wp.float64, requires_grad=True, device="cpu")
+        tape = wp.Tape()
+        with tape:
+            out = gb.to_warp(f)(wx)
+        tape.backward(grads={out: wp.ones(out.shape, dtype=wp.float64, device="cpu")})
+
+
+@pytest.mark.parametrize("consumer", ["numpy", "jax", "tf", "warp"])
+def test_captured_torch_parameters_get_gradients(consumer):
+    """A network's parameters captured by the wrapped function train when another framework drives it.
+
+    Every parameter is checked: an earlier graph walk silently skipped some of them.
+    """
+    net = _mlp()
+    x = np.random.default_rng(0).standard_normal((5, 3))
+    ref = _reference_param_grads(net, x)
+    net.zero_grad()
+    _run_consumer(consumer, gb.from_torch(lambda a: net(a)), x)
+    for p, r in zip(net.parameters(), ref):
+        assert p.grad is not None, "parameter gradient dropped"
+        torch.testing.assert_close(p.grad, r)
+
+
+def test_captured_parameter_gradients_accumulate():
+    """Like PyTorch's backward(), two passes accumulate into .grad."""
+    net = _mlp()
+    x = np.random.default_rng(0).standard_normal((5, 3))
+    ref = _reference_param_grads(net, x)
+    net.zero_grad()
+    f = gb.from_torch(lambda a: net(a))
+    for _ in range(2):
+        _run_consumer("jax", f, x)
+    for p, r in zip(net.parameters(), ref):
+        torch.testing.assert_close(p.grad, 2 * r)
+
+
+def test_captured_leaves_stop_at_the_inputs():
+    """The walk must not reach the caller's graph upstream of the inputs (no double counting)."""
+    caller = torch.nn.Linear(3, 3).double()
+    inner = _mlp()
+    x = torch.randn(4, 3, dtype=torch.float64)
+    # device= keeps the PyTorch->PyTorch call on the bridged path instead of native composition.
+    f = gb.to_torch(gb.from_torch(lambda a: inner(a), device="cpu"))
+    caller.zero_grad()
+    inner.zero_grad()
+    f(caller(x)).sum().backward()
+    got = [p.grad.clone() for p in caller.parameters()]
+    caller.zero_grad()
+    inner.zero_grad()
+    inner(caller(x)).sum().backward()
+    for g, p in zip(got, caller.parameters()):
+        torch.testing.assert_close(g, p.grad)
+
+
+def test_captured_parameter_gradients_survive_jit_dead_code_elimination():
+    """Under jit, a backward whose JAX-side result is discarded must still update the parameters.
+
+    The PyTorch VJP is declared side-effecting, so XLA cannot drop it as dead code.
+    """
+    net = _mlp()
+    x = jax.device_put(np.random.default_rng(0).standard_normal((5, 3)), jax.devices("cpu")[0])
+    f = gb.to_jax(gb.from_torch(lambda a: net(a)))
+
+    @jax.jit
+    def step(x):
+        jax.grad(lambda a: jnp.sum(f(a)))(x)  # only for the torch parameters' gradients
+        return jnp.zeros(())
+
+    net.zero_grad()
+    step(x).block_until_ready()
+    ref = _reference_param_grads(_mlp(), np.asarray(x))
+    for p, r in zip(net.parameters(), ref):
+        assert p.grad is not None, "the backward was dropped as dead code"
+        torch.testing.assert_close(p.grad, r)
+
+
+@pytest.mark.parametrize("transform", ["jit", "vmap_grad"])
+def test_jax_consumer_without_warp(monkeypatch, transform):
+    """Without Warp the JAX consumer uses host callbacks (io_callback for PyTorch VJPs): still correct."""
+    import gradbridge.jax as gbj
+
+    monkeypatch.setattr(gbj, "_warp_or_none", lambda: None)
+    net = _mlp()
+    f = gb.to_jax(gb.from_torch(lambda a: net(a)))
+    x = jax.device_put(np.random.default_rng(0).standard_normal((5, 3)), jax.devices("cpu")[0])
+    if transform == "jit":
+        net.zero_grad()
+        jax.jit(jax.grad(lambda a: jnp.sum(f(a))))(x)
+        for p, r in zip(net.parameters(), _reference_param_grads(_mlp(), np.asarray(x))):
+            torch.testing.assert_close(p.grad, r)
+    else:
+        g = jax.vmap(jax.grad(lambda a: jnp.sum(f(a[None]))))(x)
+        ref = torch.func.vmap(torch.func.grad(lambda a: net(a[None]).sum()))(torch.tensor(np.asarray(x)))
+        np.testing.assert_allclose(np.asarray(g), ref.detach().numpy(), rtol=1e-10)

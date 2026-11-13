@@ -673,3 +673,24 @@ def test_tf_consumer_falls_back_without_the_op(monkeypatch):
     x64 = np.linspace(0.1, 1.0, 5)
     np.testing.assert_allclose(out.numpy(), 2 * np.sin(x64), rtol=1e-12)
     np.testing.assert_allclose(g.numpy(), 2 * np.cos(x64), rtol=1e-12)
+
+
+def test_captured_parameters_through_jax_ffi_survive_dce():
+    """GPU (XLA FFI) path: a discarded backward under jit still trains the captured network."""
+    require_gpu("torch", "jax")
+    torch.manual_seed(0)
+    net = torch.nn.Linear(3, 2).double().cuda()
+    xn = np.random.default_rng(0).standard_normal((5, 3))
+    net(torch.tensor(xn, device="cuda")).sum().backward()
+    ref = net.weight.grad.clone()
+    net.zero_grad()
+    f = gb.to_jax(gb.from_torch(lambda a: net(a)))
+
+    @jax.jit
+    def step(x):
+        jax.grad(lambda a: jnp.sum(f(a)))(x)
+        return jnp.zeros(())
+
+    step(jax.device_put(xn, gpu_device())).block_until_ready()
+    assert net.weight.grad is not None, "the backward was dropped as dead code"
+    torch.testing.assert_close(net.weight.grad, ref)
