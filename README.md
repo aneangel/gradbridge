@@ -44,6 +44,10 @@ More complete examples:
 - [Training through a Newton physics simulation from PyTorch](https://github.com/aneangel/gradbridge/blob/main/examples/newton_ball_torch.py)
   — reproduces Newton's native training loop bit for bit
 
+Warp simulations with many small kernels can pass `capture=True` to `from_warp`: gradbridge
+replays the forward and backward as CUDA graphs, which takes that Newton example from 63 ms to
+5 ms per training iteration ([details and contract](https://github.com/aneangel/gradbridge/blob/main/docs/guide.md#many-small-kernels-capturetrue)).
+
 ## Known limitations
 
 - **Bridge coarse functions.** Each call costs a few tenths of a millisecond and nothing fuses

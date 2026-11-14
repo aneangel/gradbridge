@@ -56,6 +56,31 @@ grad = jax.jit(jax.grad(lambda v: jnp.sum((sim(v.reshape(1, 2))[0] - target) ** 
 `in_dtypes` maps `(N, 2)`/`(N, 3)` arrays to Warp vector arrays. Warp functions must allocate
 their outputs with `requires_grad=True` so Warp can store their adjoints.
 
+### Many small kernels: `capture=True`
+
+A simulator that launches hundreds of small kernels per call spends most of its time in Python,
+once per launch, forward and backward. `gb.from_warp(simulate, capture=True)` records the
+forward and the backward as CUDA graphs on the second call with a given input shape and replays
+them afterwards, from PyTorch or JAX:
+
+```python
+sim = gb.to_torch(gb.from_warp(scene.rollout, in_dtypes=[wp.vec3], capture=True))
+```
+
+On Newton's `example_diffsim_ball` (288 substeps) this takes a training iteration from 63 ms to
+5 ms, with results bit-identical to Newton's own training loop
+([example](https://github.com/aneangel/gradbridge/blob/main/examples/newton_ball_torch.py)).
+
+The contract: **every call must launch the same kernels, on the same arrays, with the same
+scalar arguments.** A replay re-issues the recorded launches; it does not run your Python
+again. Arrays your function reads are read at replay time (a simulator's state buffers are
+fine), but a scalar that changes between calls (a time `t`, a random seed, a step counter) is
+replayed with its captured value, silently. Pass such values as input arrays instead. Each
+input shape gets its own graph (up to 8), each holding one copy of the forward's intermediates.
+If capture fails (for example, your function reads an array on the host), gradbridge warns once
+and runs that function without graphs. Check a new function once with `gb.gradcheck` or against
+`capture=False` before relying on it.
+
 ## PyTorch networks inside other frameworks
 
 Tensors a PyTorch function captures, such as an `nn.Module`'s parameters, receive gradients

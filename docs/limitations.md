@@ -16,6 +16,19 @@
   `wp.jax_kernel` launches a single kernel from inside XLA in about 0.09 ms. When the work is one
   Warp kernel whose outputs have the shape of its launch grid, use `jax_kernel` for the JAX side;
   gradbridge is the better fit for whole functions, other source frameworks, and PyTorch callers.
+  For functions with many kernels, `from_warp(..., capture=True)` removes most of the per-launch
+  cost ([guide](guide.md#many-small-kernels-capturetrue)).
+
+## CUDA graphs
+
+- **`from_warp(..., capture=True)` replays captured scalars.** See the contract in the
+  [guide](guide.md#many-small-kernels-capturetrue): a scalar argument that changes between
+  calls is replayed with its captured value without any error.
+- **Graphs cover Warp sources only.** A Warp program that calls a PyTorch network inside (via
+  `to_warp`) records Python callbacks on its tape and runs without graphs.
+- **Bridged calls cannot run inside `torch.cuda.graph` capture**, with or without
+  `capture=True`; the cross-stream ordering between PyTorch and Warp is not capturable there.
+  `capture=True` is the supported way to get graph replays for the Warp side.
 
 ## Data movement
 

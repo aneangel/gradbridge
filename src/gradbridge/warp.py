@@ -13,6 +13,7 @@ via ``Tape.record_func``.
 from __future__ import annotations
 
 import contextlib
+import warnings
 import weakref
 from typing import Any, Callable, Optional, Sequence
 
@@ -71,20 +72,59 @@ _UNSET = object()
 
 
 class _Residual:
-    __slots__ = ("tape", "wxs", "outs", "xs", "_ranges", "stale", "__weakref__")
+    __slots__ = ("tape", "wxs", "outs", "xs", "_ranges", "stale", "graph", "__weakref__")
 
-    def __init__(self, tape, wxs, outs, xs):
+    def __init__(self, tape, wxs, outs, xs, graph=None):
         self.tape, self.wxs, self.outs, self.xs = tape, wxs, outs, xs
         self._ranges = _UNSET
         self.stale = False
+        self.graph = graph
 
     @property
     def ranges(self):
+        if self.graph is not None:
+            return self.graph.ranges
         # Computed only when an overlap check needs it: in the common forward -> backward pattern
         # no other residual is alive, and a long tape is never scanned.
         if self._ranges is _UNSET:
             self._ranges = _touched_ranges(self.tape)
         return self._ranges
+
+
+# =============================================================================
+# CUDA graphs (from_warp(..., capture=True))
+# =============================================================================
+# A graph replays every recorded launch with the addresses and scalar arguments it was captured
+# with. So the graph owns fixed input buffers (inputs are copied in), and outputs and input
+# gradients are cloned out before the next replay overwrites them. Each replay registers its
+# residual like an eager forward: it overlaps the previous replay's memory, which marks that
+# residual stale, so its backward recomputes.
+_MAX_GRAPHS = 8  # per function: one graph per input signature (shape, dtype, device)
+_NOT_CAPTURED = None  # bwd not captured yet: the first backward runs eagerly (fills tape.gradients)
+_EAGER = False  # bwd cannot be captured (the tape records Python callbacks)
+
+
+class _Graph:
+    __slots__ = ("wxs", "tape", "outs", "cts", "fwd", "bwd", "_ranges")
+
+    def __init__(self, wxs, tape, outs, fwd):
+        self.wxs, self.tape, self.outs, self.fwd = wxs, tape, outs, fwd
+        self.cts = [wp.empty_like(o, requires_grad=False) for o in outs]
+        self.bwd = _NOT_CAPTURED
+        self._ranges = _UNSET
+
+    @property
+    def ranges(self):
+        if self._ranges is _UNSET:
+            self._ranges = _touched_ranges(self.tape)
+        return self._ranges
+
+
+def _warn_capture(name, reason):
+    warnings.warn(
+        f"gradbridge.from_warp('{name}', capture=True): {reason}; running without a CUDA graph.",
+        stacklevel=4,
+    )
 
 
 def _is_plain_value(arg) -> bool:
@@ -192,6 +232,7 @@ def from_warp(
     n_inputs: Optional[int] = None,
     name: Optional[str] = None,
     batched: bool = False,
+    capture: bool = False,
 ) -> DiffFunction:
     """Wrap ``fn(*wp_arrays) -> wp.array | tuple`` that launches Warp kernels.
 
@@ -200,9 +241,88 @@ def from_warp(
 
     ``in_dtypes`` lets inputs be Warp vector/matrix types: a NumPy/Torch array
     of shape ``(N, 3)`` becomes ``wp.array(dtype=wp.vec3, shape=N)``.
+
+    ``capture=True`` records ``fn``'s forward and backward as CUDA graphs on the
+    second call with a given input signature and replays them afterwards, which
+    removes the per-launch Python cost of many small kernels. ``fn`` must launch
+    the same kernels on the same arrays with the same scalar arguments on every
+    call: a replay reuses the captured scalars and arrays (reading their current
+    contents), whatever ``fn`` would choose or allocate if it ran again. Each
+    graph keeps one copy of the forward's intermediates.
     """
     name = name or getattr(fn, "__name__", "warp_fn")
     n_in = infer_n_inputs(fn, n_inputs)
+    graphs: dict = {}  # input signature -> _Graph, or None when it cannot be captured
+    seen: set = set()
+
+    def _graph(wxs, build):
+        """The graph for these inputs, captured on the second sighting; None means run eagerly."""
+        if not wxs:
+            return None
+        device = wxs[0].device
+        if not device.is_cuda or device.is_capturing or _convert.stream_is_capturing(wp.get_stream(device).cuda_stream):
+            return None  # inside someone else's graph capture, launches must stay ordinary launches
+        if any(x.device != device for x in wxs):
+            return None
+        key = tuple((x.shape, x.dtype, x.requires_grad) for x in wxs) + (device.ordinal,)
+        if key in graphs or not build:
+            return graphs.get(key)
+        if key not in seen:
+            seen.add(key)  # the first call runs eagerly: it compiles and loads every kernel
+            return None
+        if len(graphs) >= _MAX_GRAPHS:
+            graphs[key] = None
+            _warn_capture(name, f"more than {_MAX_GRAPHS} input shapes")
+            return None
+        graphs[key] = g = _capture(wxs, device)
+        return g
+
+    def _capture(wxs, device):
+        static = [wp.empty_like(x, requires_grad=x.requires_grad) for x in wxs]
+        tape = wp.Tape()
+        try:
+            with wp.ScopedCapture(device=device, force_module_load=False) as cap:
+                with tape:
+                    outs = _as_tuple(fn(*static))
+        except Exception as e:
+            _warn_capture(name, f"capture failed ({type(e).__name__}: {str(e)[:200]})")
+            return None
+        _check_outputs(outs)
+        return _Graph(static, tape, outs, cap.graph)
+
+    def _replay(g, wxs, xs):
+        for dst, src in zip(g.wxs, wxs):
+            wp.copy(dst, src)
+        wp.capture_launch(g.fwd)
+        res = _Residual(g.tape, g.wxs, g.outs, xs, graph=g)
+        _invalidate(res)
+        _LIVE_RESIDUALS.append(weakref.ref(res))
+        return tuple(wp.clone(o, requires_grad=False) for o in g.outs), res
+
+    def _replay_bwd(g, cts):
+        for dst, c, o in zip(g.cts, cts, g.outs):
+            wp.copy(dst, _convert.to_warp(c, dtype=o.dtype, device=o.device))
+        if g.bwd:
+            wp.capture_launch(g.bwd)
+        else:
+            _zero_gradients(g.tape)
+            g.tape.backward(grads=dict(zip(g.outs, g.cts)))
+            if g.bwd is _NOT_CAPTURED:
+                # Captured after a backward, so tape.gradients also lists the temporary adjoints
+                # that backward allocated, and the recorded zero() clears all of them.
+                g.bwd = _EAGER
+                if all(isinstance(launch, list) for launch in g.tape.launches):
+                    try:
+                        with wp.ScopedCapture(device=g.wxs[0].device, force_module_load=False) as cap:
+                            g.tape.zero()
+                            g.tape.backward(grads=dict(zip(g.outs, g.cts)))
+                        g.bwd = cap.graph
+                    except Exception as e:
+                        _warn_capture(name, f"capturing the backward failed ({type(e).__name__}: {str(e)[:200]})")
+        return tuple(
+            wp.clone(x.grad, requires_grad=False) if x.requires_grad and x.grad is not None else wp.zeros_like(x)
+            for x in g.wxs
+        )
 
     def _inputs(xs, requires_grad):
         out = []
@@ -212,22 +332,34 @@ def from_warp(
             out.append(_convert.to_warp(x, dtype=dt, requires_grad=rg, device=device))
         return out
 
-    def _eval(*xs):
-        # No tape, so the touched memory is unknown: conservatively invalidate every cached tape.
-        _invalidate(None, everything=True)
-        return _as_tuple(fn(*_inputs(xs, requires_grad=False)))
-
-    def _fwd(*xs):
-        wxs = _inputs(xs, requires_grad=True)
-        tape = wp.Tape()
-        with tape:
-            outs = _as_tuple(fn(*wxs))
+    def _check_outputs(outs):
         for o in outs:
             if o.grad is None:
                 raise RuntimeError(
                     f"gradbridge.from_warp('{name}'): outputs must be allocated with requires_grad=True "
                     "so Warp can store their adjoints."
                 )
+
+    def _eval(*xs):
+        if capture:
+            wxs = _inputs(xs, requires_grad=True)
+            g = _graph(wxs, build=False)
+            if g is not None:
+                return _replay(g, wxs, xs)[0]
+        # No tape, so the touched memory is unknown: conservatively invalidate every cached tape.
+        _invalidate(None, everything=True)
+        return _as_tuple(fn(*_inputs(xs, requires_grad=False)))
+
+    def _fwd(*xs):
+        wxs = _inputs(xs, requires_grad=True)
+        if capture:
+            g = _graph(wxs, build=True)
+            if g is not None:
+                return _replay(g, wxs, xs)
+        tape = wp.Tape()
+        with tape:
+            outs = _as_tuple(fn(*wxs))
+        _check_outputs(outs)
         res = _Residual(tape, wxs, outs, xs)
         _invalidate(res)
         _LIVE_RESIDUALS.append(weakref.ref(res))
@@ -237,6 +369,8 @@ def from_warp(
         if res.stale:
             # A later call overwrote memory this tape reads: replay the forward first.
             res = _fwd(*res.xs)[1]
+        if res.graph is not None:
+            return _replay_bwd(res.graph, cts)
         tape, wxs, outs = res.tape, res.wxs, res.outs
         # Outputs always own a .grad here, so Tape.backward copies the cotangents into it
         # instead of adopting the caller's arrays as .grad (which tape.zero() would then wipe).

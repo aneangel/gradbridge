@@ -138,6 +138,27 @@ def _is_blocking(handle: int) -> bool:
     return blocking
 
 
+_LIBCUDA: list = []
+
+
+def stream_is_capturing(handle: int) -> bool:
+    """Whether a CUDA stream is being captured into a graph right now (by anyone).
+
+    Unknown (no driver library, an error) counts as capturing, so callers stay on the safe path.
+    """
+    try:
+        import ctypes
+
+        if not _LIBCUDA:
+            _LIBCUDA.append(ctypes.CDLL("libcuda.so.1"))
+        status = ctypes.c_int()
+        if _LIBCUDA[0].cuStreamIsCapturing(ctypes.c_void_p(handle), ctypes.byref(status)) != 0:
+            return True
+        return status.value != 0  # CU_STREAM_CAPTURE_STATUS_NONE
+    except Exception:  # pragma: no cover - platform dependent
+        return True
+
+
 def _torch_and_warp_streams(torch_device):
     """(Warp's current stream, a Warp wrapper of torch's current stream), or None when CUDA already
     orders them: torch on the legacy default stream (handle 0) synchronizes implicitly, in both

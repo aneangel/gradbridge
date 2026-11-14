@@ -6,7 +6,8 @@ the Warp rollout to PyTorch, so PyTorch optimizers and networks train through th
 
 1. Equivalence: ``torch.optim.SGD`` through gradbridge reproduces Newton's native training loop.
 2. A PyTorch MLP policy learns ``target -> launch velocity`` through the simulation.
-3. Cost per iteration: native Warp, gradbridge, and a hand-written ``torch.autograd.Function``.
+3. Cost per iteration: native Warp, a hand-written ``torch.autograd.Function``, and gradbridge,
+   eagerly and with ``capture=True`` (the rollout replayed as CUDA graphs, results bit-identical).
 
 Requires ``newton`` (https://github.com/newton-physics/newton) and a CUDA GPU.
 """
@@ -108,9 +109,9 @@ def native_training(iters, lr):
     return history
 
 
-def torch_training(iters, lr):
+def torch_training(iters, lr, capture=False):
     """The same optimization, written in PyTorch: the simulator is just a differentiable function."""
-    simulate = gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3]))
+    simulate = gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3], capture=capture))
     v0 = torch.tensor([START_VEL], device="cuda", requires_grad=True)
     target = torch.tensor([TARGET], device="cuda")
     opt = torch.optim.SGD([v0], lr=lr)
@@ -232,6 +233,9 @@ def cost_per_iteration():
         "gradbridge, cache_residuals=False (recompute)": time_ms(
             torch_step(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3]), cache_residuals=False))
         ),
+        "gradbridge, capture=True (CUDA graphs)": time_ms(
+            torch_step(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3], capture=True)))
+        ),
     }
 
 
@@ -240,9 +244,10 @@ def main():
     print("1. Equivalence with Newton's native training loop")
     native = native_training(iters, lr)
     bridged = torch_training(iters, lr)
-    diff = max(abs(a - b) / max(abs(a), 1e-12) for a, b in zip(native, bridged))
+    graphed = torch_training(iters, lr, capture=True)
+    diff = max(abs(a - b) / max(abs(a), 1e-12) for a, b in zip(native * 2, bridged + graphed))
     for i in (0, 10, 20, iters - 1):
-        print(f"  iter {i:2d}  native {native[i]:.6f}   torch+gradbridge {bridged[i]:.6f}")
+        print(f"  iter {i:2d}  native {native[i]:.6f}   torch+gradbridge {bridged[i]:.6f}   capture=True {graphed[i]:.6f}")
     print(f"  max relative difference over {iters} iterations: {diff:.2e}")
 
     print("\n2. PyTorch MLP policy trained through Newton (target -> launch velocity)")
