@@ -35,10 +35,16 @@ _FRAMEWORK_BY_MODULE = {
 }
 
 
+_FRAMEWORK_BY_TYPE: dict = {}
+
+
 def framework_of(x) -> str:
     """Return the framework name that owns array ``x``."""
-    mod = type(x).__module__.split(".")[0]
-    return _FRAMEWORK_BY_MODULE.get(mod, "numpy")
+    t = type(x)
+    fw = _FRAMEWORK_BY_TYPE.get(t)
+    if fw is None:  # called on every conversion: resolve each type once
+        fw = _FRAMEWORK_BY_TYPE[t] = _FRAMEWORK_BY_MODULE.get(t.__module__.split(".")[0], "numpy")
+    return fw
 
 
 # ----------------------------------------------------------------------------- numpy
@@ -108,31 +114,81 @@ def _dlpack_ok(x) -> bool:
 _TORCH_STREAM_WRAPPERS: dict = {}
 
 
+_STREAM_IS_BLOCKING: dict = {}
+
+
+def _is_blocking(handle: int) -> bool:
+    """Whether a CUDA stream was created blocking (asks the driver once per handle).
+
+    Unknown (no driver library, an error) counts as non-blocking, which keeps the explicit wait.
+    """
+    blocking = _STREAM_IS_BLOCKING.get(handle)
+    if blocking is None:
+        blocking = False
+        try:
+            import ctypes
+
+            flags = ctypes.c_uint()
+            lib = ctypes.CDLL("libcuda.so.1")
+            if lib.cuStreamGetFlags(ctypes.c_void_p(handle), ctypes.byref(flags)) == 0:
+                blocking = not (flags.value & 0x1)  # CU_STREAM_NON_BLOCKING
+        except Exception:  # pragma: no cover - platform dependent
+            pass
+        _STREAM_IS_BLOCKING[handle] = blocking
+    return blocking
+
+
 def _torch_and_warp_streams(torch_device):
-    """(Warp's current stream, a Warp wrapper of torch's current stream) on ``torch_device``."""
+    """(Warp's current stream, a Warp wrapper of torch's current stream), or None when CUDA already
+    orders them: torch on the legacy default stream (handle 0) synchronizes implicitly, in both
+    directions, with every blocking stream in the context -- which Warp's own streams are."""
     import torch
-    import warp as wp
 
     index = torch_device.index if torch_device.index is not None else torch.cuda.current_device()
-    wp_stream = wp.get_stream(f"cuda:{index}")
-    torch_stream = torch.cuda.current_stream(index)
-    key = (index, torch_stream.cuda_stream)
+    wp_stream = _warp_device(index).stream
+    handle = _torch_stream_handle(index)
+    if handle == 0 and _is_blocking(wp_stream.cuda_stream):
+        return None
+    key = (index, handle)
     wrapper = _TORCH_STREAM_WRAPPERS.get(key)
     if wrapper is None:
-        wrapper = _TORCH_STREAM_WRAPPERS[key] = wp.stream_from_torch(torch_stream)
+        import warp as wp
+
+        wrapper = _TORCH_STREAM_WRAPPERS[key] = wp.stream_from_torch(torch.cuda.current_stream(index))
     return wp_stream, wrapper
 
 
+_WARP_DEVICES: dict = {}
+
+
+def _warp_device(index: int):
+    dev = _WARP_DEVICES.get(index)
+    if dev is None:
+        import warp as wp
+
+        dev = _WARP_DEVICES[index] = wp.get_device(f"cuda:{index}")
+    return dev
+
+
+def _torch_stream_handle(index: int) -> int:
+    """Raw handle of torch's current stream (called per conversion; the public API builds a
+    Stream object each time, several times slower)."""
+    import torch
+
+    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    return raw(index) if raw is not None else torch.cuda.current_stream(index).cuda_stream
+
+
 def _warp_after_torch(torch_device):
-    wp_stream, torch_stream = _torch_and_warp_streams(torch_device)
-    if wp_stream.cuda_stream != torch_stream.cuda_stream:
-        wp_stream.wait_stream(torch_stream)
+    streams = _torch_and_warp_streams(torch_device)
+    if streams is not None and streams[0].cuda_stream != streams[1].cuda_stream:
+        streams[0].wait_stream(streams[1])
 
 
 def _torch_after_warp(torch_device):
-    wp_stream, torch_stream = _torch_and_warp_streams(torch_device)
-    if wp_stream.cuda_stream != torch_stream.cuda_stream:
-        torch_stream.wait_stream(wp_stream)
+    streams = _torch_and_warp_streams(torch_device)
+    if streams is not None and streams[0].cuda_stream != streams[1].cuda_stream:
+        streams[1].wait_stream(streams[0])
 
 
 # ----------------------------------------------------------------------------- torch

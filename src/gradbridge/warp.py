@@ -150,6 +150,10 @@ def _invalidate(new, everything=False):
     _LIVE_RESIDUALS[:] = alive
 
 
+def _torch_cuda(t) -> bool:
+    return _convert.framework_of(t) == "torch" and t.is_cuda
+
+
 @wp.kernel
 def _accumulate(dst: wp.array(dtype=Any), src: wp.array(dtype=Any)):
     i = wp.tid()
@@ -299,15 +303,26 @@ def to_warp(fn, *, out_dtypes: Optional[Sequence] = None, device=None) -> Callab
                 cts = [o.grad if o.grad is not None else wp.zeros_like(o) for o in w_outs]
                 with _tape_paused():
                     in_cts = dfn.bwd(res, *cts)
-                for x, ct in zip(wxs, in_cts):
-                    if isinstance(x, wp.array) and x.requires_grad:
-                        g = _convert.to_warp(ct, dtype=x.grad.dtype, device=x.grad.device)
-                        wp.launch(
-                            _accumulate,
-                            dim=x.grad.size,
-                            inputs=[x.grad.flatten(), g.flatten()],
-                            device=x.grad.device,
-                        )
+                pairs = [(x, ct) for x, ct in zip(wxs, in_cts) if isinstance(x, wp.array) and x.requires_grad]
+                if pairs and all(_torch_cuda(ct) and x.grad.device.is_cuda for x, ct in pairs):
+                    # PyTorch cotangents: accumulate with in-place torch adds on zero-copy views of
+                    # x.grad (one stream handshake each way for all of them) instead of a Warp
+                    # launch plus a conversion per input.
+                    device = pairs[0][1].device
+                    _convert._torch_after_warp(device)
+                    for x, ct in pairs:
+                        view = wp.to_torch(x.grad, requires_grad=False)
+                        view.add_(ct.reshape(view.shape).to(view.dtype))
+                    _convert._warp_after_torch(device)
+                    return
+                for x, ct in pairs:
+                    g = _convert.to_warp(ct, dtype=x.grad.dtype, device=x.grad.device)
+                    wp.launch(
+                        _accumulate,
+                        dim=x.grad.size,
+                        inputs=[x.grad.flatten(), g.flatten()],
+                        device=x.grad.device,
+                    )
 
             tape.record_func(backward, arrays=grad_inputs + [o for o in w_outs if o.requires_grad])
 
