@@ -222,12 +222,12 @@ def from_warp(
         grads = {o: _convert.to_warp(c, dtype=o.dtype, device=o.device) for o, c in zip(outs, cts)}
         tape.zero()
         tape.backward(grads=grads)
-        # Clone on the device before tape.zero(): callers may hold these zero-copy.
-        result = tuple(
+        # Clone: recorded adjoint launches keep pointing at these buffers, so a reuse of this
+        # residual (retain_graph) writes into them again. No trailing tape.zero(): every backward
+        # zeroes first, so clearing again here would only cost memsets.
+        return tuple(
             wp.clone(x.grad) if x.requires_grad and x.grad is not None else wp.zeros_like(x) for x in wxs
         )
-        tape.zero()
-        return result
 
     dfn = DiffFunction(
         _eval,

@@ -442,3 +442,32 @@ def test_jax_consumer_without_warp(monkeypatch, transform):
         g = jax.vmap(jax.grad(lambda a: jnp.sum(f(a[None]))))(x)
         ref = torch.func.vmap(torch.func.grad(lambda a: net(a[None]).sum()))(torch.tensor(np.asarray(x)))
         np.testing.assert_allclose(np.asarray(g), ref.detach().numpy(), rtol=1e-10)
+
+
+# ============================================================================= Warp residual reuse
+@wp.kernel
+def _square_kernel(x: wp.array(dtype=wp.float64), y: wp.array(dtype=wp.float64)):
+    i = wp.tid()
+    y[i] = x[i] * x[i]
+
+
+def _warp_square(x):
+    y = wp.zeros_like(x, requires_grad=True)
+    wp.launch(_square_kernel, dim=x.shape[0], inputs=[x], outputs=[y], device=x.device)
+    return y
+
+
+def test_warp_residual_reused_by_retain_graph():
+    """A Warp source's residual reused by a second backward() gives the gradient again, exactly.
+
+    Each backward hands its gradient buffer to the caller; a reused residual must allocate a new
+    one rather than write into (or zero) the buffer the caller already holds.
+    """
+    f = gb.to_torch(gb.from_warp(_warp_square))
+    x = torch.arange(1.0, 6.0, dtype=torch.float64, requires_grad=True)
+    out = f(x)
+    out.sum().backward(retain_graph=True)
+    first = x.grad.clone()
+    out.sum().backward()
+    torch.testing.assert_close(first, 2 * x.detach())
+    torch.testing.assert_close(x.grad, 4 * x.detach())
