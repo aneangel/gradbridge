@@ -129,7 +129,6 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false TF_FORCE_GPU_ALLOW_GROWTH=true \
 
 ## Roadmap
 
-- Multi-GPU validation
 - Finer stream handshakes in place of the remaining host waits
 - Automatic forward-mode integration for TensorFlow; compiled higher-order derivatives for PyTorch
 - Broader native lowering and batching for signatures that still require callbacks or host fallback
