@@ -129,9 +129,7 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false TF_FORCE_GPU_ALLOW_GROWTH=true \
 
 ## Roadmap
 
-- Finer stream handshakes in place of the remaining host waits
 - Automatic forward-mode integration for TensorFlow; compiled higher-order derivatives for PyTorch
-- Broader native lowering and batching for signatures that still require callbacks or host fallback
 - A compatibility matrix to narrow the TensorFlow/Triton import-order guard
 - A rollout layer: truncated backpropagation windows, checkpointing and gradient-health reports
   for long differentiable simulations
