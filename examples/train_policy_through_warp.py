@@ -4,12 +4,13 @@ An MLP maps a target (distance, height) to a launch velocity. A projectile with 
 is simulated in Warp for 200 steps (one kernel launch per step), and the loss is the squared
 miss distance. The same training runs three ways:
 
-  hand-written   a torch.autograd.Function around a wp.Tape (the usual pattern, ~18 lines)
-  gradbridge     gb.to_torch(gb.from_warp(simulate))                          (1 line)
-  capture=True   the same line with capture=True: forward and backward replay as CUDA graphs
+  hand-written          a torch.autograd.Function around a wp.Tape (the usual pattern)
+  hand-written, graphs  the same, with forward and backward captured as CUDA graphs by hand
+  gradbridge            gb.to_torch(gb.from_warp(simulate))                        (1 line)
+  capture=True          the same line with capture=True: gradbridge captures the graphs
 
-All three produce identical gradients and identical training curves; the output shows the
-loss live, then the cost per iteration.
+All four produce identical gradients and identical training curves; the output shows the loss
+live, then the cost per iteration (graphs compared with graphs).
 
 Requires PyTorch and Warp with a CUDA GPU.
 """
@@ -78,9 +79,52 @@ class HandWritten(torch.autograd.Function):
         return grad
 
 
+class Graphs:
+    """CUDA graphs of ``simulate`` for one batch size, captured by hand."""
+
+    def __init__(self, n):
+        self.v0 = wp.zeros(n, dtype=wp.vec2, requires_grad=True)
+        self.grad_out = wp.zeros(n, dtype=wp.vec2)
+        self.tape = wp.Tape()
+        with wp.ScopedCapture() as capture:
+            with self.tape:
+                self.out = simulate(self.v0)
+        self.forward = capture.graph
+        with wp.ScopedCapture() as capture:
+            # No tape.zero() in here: recording it before any backward would clear nothing, since
+            # Warp lists a tape's gradient buffers only during backward. Zero after each replay.
+            self.tape.backward(grads={self.out: self.grad_out})
+        self.backward = capture.graph
+
+
+class HandWrittenGraphed(torch.autograd.Function):
+    """Correct only while every forward is followed by its own backward (the graphs' buffers are
+    fixed), and only for the batch size the graphs were captured with."""
+
+    graphs = None
+
+    @staticmethod
+    def forward(ctx, v0):
+        g = HandWrittenGraphed.graphs
+        wp.copy(g.v0, wp.from_torch(v0.detach().contiguous(), dtype=wp.vec2))
+        wp.capture_launch(g.forward)
+        return wp.to_torch(g.out).clone()
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        g = HandWrittenGraphed.graphs
+        wp.copy(g.grad_out, wp.from_torch(grad_out.contiguous(), dtype=wp.vec2))
+        wp.capture_launch(g.backward)
+        grad = wp.to_torch(g.v0.grad).clone()
+        g.tape.zero()
+        return grad
+
+
 # ============================================================================= with gradbridge
+HandWrittenGraphed.graphs = Graphs(BATCH)
 METHODS = {
     "hand-written": HandWritten.apply,
+    "hand-written, graphs": HandWrittenGraphed.apply,
     "gradbridge": gb.to_torch(gb.from_warp(simulate, in_dtypes=[wp.vec2])),
     "capture=True": gb.to_torch(gb.from_warp(simulate, in_dtypes=[wp.vec2], capture=True)),
 }
@@ -121,7 +165,7 @@ def train(name, sim):
         times.append(time.perf_counter() - t0)
         losses.append(loss.item())
         if it % 50 == 0 or it == ITERS - 1:
-            print(f"  {name:13s} iter {it:3d}   miss {losses[-1] ** 0.5 * 100:7.2f} cm")
+            print(f"  {name:21s} iter {it:3d}   miss {losses[-1] ** 0.5 * 100:7.2f} cm")
     return losses, 1e3 * float(np.median(times[5:]))  # skip compile and graph-capture iterations
 
 
@@ -135,17 +179,16 @@ def main():
             policy.zero_grad()
             loss_fn(policy, sim, targets(0)).backward()
         grads[name] = torch.cat([p.grad.flatten() for p in policy.parameters()])
-    for name in ("gradbridge", "capture=True"):
-        print(f"  {name:13s} bit-identical to hand-written: {torch.equal(grads[name], grads['hand-written'])}")
+    for name in list(METHODS)[1:]:
+        print(f"  {name:21s} bit-identical to hand-written: {torch.equal(grads[name], grads['hand-written'])}")
 
     print("\n2. Training, live")
     results = {name: train(name, sim) for name, sim in METHODS.items()}
 
     print("\n3. Cost per training iteration (median)")
-    base = results["hand-written"][1]
     for name, (losses, ms) in results.items():
         same = losses == results["hand-written"][0]
-        print(f"  {name:13s} {ms:6.2f} ms   {base / ms:4.1f}x   identical training curve: {same}")
+        print(f"  {name:21s} {ms:6.2f} ms   identical training curve: {same}")
 
 
 if __name__ == "__main__":

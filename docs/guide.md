@@ -68,8 +68,10 @@ sim = gb.to_torch(gb.from_warp(scene.rollout, in_dtypes=[wp.vec3], capture=True)
 ```
 
 On Newton's `example_diffsim_ball` (288 substeps) this takes a training iteration from 63 ms to
-5 ms, with results bit-identical to Newton's own training loop
+5 ms, the same speed as Newton's own loop with its own CUDA graph, and bit-identical results
 ([example](https://github.com/aneangel/gradbridge/blob/main/examples/newton_ball_torch.py)).
+The example also times a hand-written bridge with hand-captured graphs: all three match. What
+`capture=True` saves is writing and maintaining that capture code, and the cases it gets wrong.
 
 The contract: **every call must launch the same kernels, on the same arrays, with the same
 scalar arguments.** A replay re-issues the recorded launches; it does not run your Python

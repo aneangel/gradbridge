@@ -6,8 +6,10 @@ the Warp rollout to PyTorch, so PyTorch optimizers and networks train through th
 
 1. Equivalence: ``torch.optim.SGD`` through gradbridge reproduces Newton's native training loop.
 2. A PyTorch MLP policy learns ``target -> launch velocity`` through the simulation.
-3. Cost per iteration: native Warp, a hand-written ``torch.autograd.Function``, and gradbridge,
-   eagerly and with ``capture=True`` (the rollout replayed as CUDA graphs, results bit-identical).
+3. Cost per iteration, each approach without and with CUDA graphs: Newton's native loop (with
+   graphs exactly as ``example_diffsim_ball`` captures them), a hand-written
+   ``torch.autograd.Function`` (with graphs written by hand), and gradbridge (``capture=True``).
+   Every approach is checked to produce the same gradient.
 
 Requires ``newton`` (https://github.com/newton-physics/newton) and a CUDA GPU.
 """
@@ -188,6 +190,43 @@ class HandWrittenBridge(torch.autograd.Function):
         return g, None
 
 
+class RolloutGraphs:
+    """CUDA graphs of one rollout, captured by hand: fixed buffers, a forward and a backward graph."""
+
+    def __init__(self, scene):
+        self.wv0 = wp.zeros(1, dtype=wp.vec3, requires_grad=True)
+        self.grad_out = wp.zeros(1, dtype=wp.vec3)
+        self.tape = wp.Tape()
+        with wp.ScopedCapture() as capture:
+            with self.tape:
+                self.out = scene.rollout(self.wv0)
+        self.forward = capture.graph
+        with wp.ScopedCapture() as capture:
+            self.tape.backward(grads={self.out: self.grad_out})
+        self.backward = capture.graph
+
+
+class HandWrittenGraphedBridge(torch.autograd.Function):
+    """The hand-written bridge with CUDA graphs. Correct only while every forward is followed by
+    its own backward: a second forward before backward would overwrite the first's intermediates."""
+
+    @staticmethod
+    def forward(ctx, v0, graphs):
+        wp.copy(graphs.wv0, wp.from_torch(v0.detach().contiguous(), dtype=wp.vec3))
+        wp.capture_launch(graphs.forward)
+        ctx.graphs = graphs
+        return wp.to_torch(graphs.out).clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        graphs = ctx.graphs
+        wp.copy(graphs.grad_out, wp.from_torch(grad.contiguous(), dtype=wp.vec3))
+        wp.capture_launch(graphs.backward)
+        g = wp.to_torch(graphs.wv0.grad).clone()
+        graphs.tape.zero()
+        return g, None
+
+
 def time_ms(step, reps=30):
     for _ in range(3):
         step()
@@ -202,41 +241,67 @@ def time_ms(step, reps=30):
 
 
 def cost_per_iteration():
+    """Median ms per forward + backward for each approach, and the gradient each one produced."""
     target = torch.tensor([TARGET], device="cuda")
-    v0 = torch.tensor([START_VEL], device="cuda", requires_grad=True)
+    target_wp = wp.vec3(*TARGET)
+    results = {}
 
-    def torch_step(fn):
+    def native(graphed):
+        # Newton's loop: a tape around rollout + loss, backward from the loss, tape.zero() after.
+        # With graphs, forward and backward are captured as one graph, as example_diffsim_ball does.
+        scene = BallScene()
+        wv0 = wp.array([START_VEL], dtype=wp.vec3, requires_grad=True)
+        loss = wp.zeros(1, dtype=float, requires_grad=True)
+        tapes = [wp.Tape()]
+
+        def forward_backward():
+            with tapes[0]:
+                wp.launch(_loss, dim=1, inputs=[scene.rollout(wv0), target_wp], outputs=[loss])
+            tapes[0].backward(loss)
+
+        graph = None
+        if graphed:
+            with wp.ScopedCapture() as capture:
+                forward_backward()
+            graph = capture.graph
+        grad = []
+
+        def step():
+            if graph is not None:
+                wp.capture_launch(graph)
+            else:
+                tapes[0] = wp.Tape()
+                forward_backward()
+            grad[:] = [wv0.grad.numpy().copy()] if not grad else grad
+            tapes[0].zero()
+
+        return step, grad
+
+    def bridged(fn):
+        v0 = torch.tensor([START_VEL], device="cuda", requires_grad=True)
+        grad = []
+
         def step():
             v0.grad = None
             ((fn(v0) - target) ** 2).sum().backward()
+            grad[:] = [v0.grad.cpu().numpy()] if not grad else grad
 
-        return step
+        return step, grad
 
-    scene = BallScene()
-    wv0 = wp.array([START_VEL], dtype=wp.vec3, requires_grad=True)
-    loss = wp.zeros(1, dtype=float, requires_grad=True)
-
-    def native():
-        tape = wp.Tape()
-        with tape:
-            wp.launch(_loss, dim=1, inputs=[scene.rollout(wv0), wp.vec3(*TARGET)], outputs=[loss])
-        tape.backward(loss)
-        tape.zero()
-
-    hand_scene = BallScene()
-    return {
-        "native Warp (tape, no CUDA graph)": time_ms(native),
-        "hand-written autograd.Function": time_ms(torch_step(lambda v: HandWrittenBridge.apply(v, hand_scene))),
-        "gradbridge (default)": time_ms(
-            torch_step(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3])))
-        ),
-        "gradbridge, cache_residuals=False (recompute)": time_ms(
-            torch_step(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3]), cache_residuals=False))
-        ),
-        "gradbridge, capture=True (CUDA graphs)": time_ms(
-            torch_step(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3], capture=True)))
+    hand_scene, graphs = BallScene(), RolloutGraphs(BallScene())
+    approaches = {
+        "native Warp": native(graphed=False),
+        "native Warp, CUDA graph": native(graphed=True),
+        "hand-written autograd.Function": bridged(lambda v: HandWrittenBridge.apply(v, hand_scene)),
+        "hand-written, CUDA graphs": bridged(lambda v: HandWrittenGraphedBridge.apply(v, graphs)),
+        "gradbridge": bridged(gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3]))),
+        "gradbridge, capture=True": bridged(
+            gb.to_torch(gb.from_warp(BallScene().rollout, in_dtypes=[wp.vec3], capture=True))
         ),
     }
+    for name, (step, grad) in approaches.items():
+        results[name] = (time_ms(step), grad[0].reshape(-1))
+    return results
 
 
 def main():
@@ -254,9 +319,11 @@ def main():
     before, after = train_policy()
     print(f"  mean miss distance on 32 held-out targets: {before:.3f} m -> {after:.3f} m")
 
-    print("\n3. Cost per optimization iteration (median ms)")
-    for name, ms in cost_per_iteration().items():
-        print(f"  {name:42s} {ms:7.2f}")
+    print("\n3. Cost per optimization iteration (median ms), each without and with CUDA graphs")
+    results = cost_per_iteration()
+    reference = results["native Warp"][1]
+    for name, (ms, grad) in results.items():
+        print(f"  {name:32s} {ms:7.2f}   same gradient as native: {np.array_equal(grad, reference)}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gradbridge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Gradients that cross framework boundaries: PyTorch, JAX, TensorFlow, NVIDIA Warp and NumPy."
 readme = "README.md"
 requires-python = ">=3.10"

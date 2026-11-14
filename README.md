@@ -40,21 +40,27 @@ through `jit`, `torch.compile`, `vmap` and higher-order derivatives where the fr
 ## What it buys you
 
 Training a PyTorch network through a Warp simulation, the usual way is a hand-written
-`torch.autograd.Function` around a `wp.Tape`. With gradbridge it is one line, and with
-`capture=True` the simulation's forward and backward replay as CUDA graphs:
+`torch.autograd.Function` around a `wp.Tape`, and for speed, CUDA graphs captured by hand
+(fixed buffers, a forward and a backward graph, gradients zeroed at the right moment). With
+gradbridge it is one line; `capture=True` captures and manages the graphs for you:
 
 ```python
 simulate = gb.to_torch(gb.from_warp(rollout, in_dtypes=[wp.vec3], capture=True))
 ```
 
-| Training iteration, forward + backward | Hand-written bridge | gradbridge | `capture=True` |
-|---|---|---|---|
-| [Newton's `example_diffsim_ball`](https://github.com/aneangel/gradbridge/blob/main/examples/newton_ball_torch.py) (288 substeps) | 62.6 ms | 63.5 ms | **5.2 ms (12×)** |
-| [MLP through a 200-step Warp projectile](https://github.com/aneangel/gradbridge/blob/main/examples/train_policy_through_warp.py) (batch 4096) | 14.3 ms | 14.8 ms | **1.9 ms (7.5×)** |
+Milliseconds per training iteration (forward + backward), each approach without / with CUDA graphs:
 
-The results are bit-identical in every column: the Newton example reproduces Newton's own
-training loop exactly, with and without graphs. Measured on one RTX 5090; run the examples to
-reproduce. `capture=True` has one rule to respect: every call must launch the same kernels with
+| | Native Warp loop | Hand-written bridge | gradbridge |
+|---|---|---|---|
+| [Newton's `example_diffsim_ball`](https://github.com/aneangel/gradbridge/blob/main/examples/newton_ball_torch.py) (288 substeps) | 62.4 / 5.0 | 62.0 / 5.2 | 63.3 / 5.2 |
+| [MLP through a 200-step Warp projectile](https://github.com/aneangel/gradbridge/blob/main/examples/train_policy_through_warp.py) (batch 4096) | — | 15.6 / 2.1 | 15.9 / 2.0 |
+
+Graphs are what make these fast (about 12× on Newton), and gradbridge matches hand-captured
+graphs, including Newton's own. What it adds is the code you no longer write and the cases it
+keeps correct: several forwards before one backward, `retain_graph`, outputs you hold on to,
+new input shapes, buffers shared with other calls. Every approach gives bit-identical gradients
+(the Newton example reproduces Newton's own training loop). Measured on one RTX 5090; run the
+examples to reproduce. `capture=True` has one rule: every call must launch the same kernels with
 the same scalar arguments (see the [guide](https://github.com/aneangel/gradbridge/blob/main/docs/guide.md#many-small-kernels-capturetrue)).
 
 Beyond PyTorch and Warp, the same two calls connect any pair of frameworks, keep GPU data on
