@@ -150,6 +150,27 @@ def _invalidate(new, everything=False):
     _LIVE_RESIDUALS[:] = alive
 
 
+def _zero_gradients(tape):
+    """Zero every gradient buffer the tape's backward accumulates into.
+
+    ``tape.zero()`` clears only what ``tape.gradients`` lists, which Warp fills during a
+    backward: on a fresh tape it clears nothing, and preallocated buffers (a simulator's state)
+    would carry the previous call's gradients into this one. Registering every recorded launch
+    argument first, with Warp's own ``get_adjoint``, makes the list complete.
+    """
+    if not tape.gradients:
+        gradients, array = tape.gradients, wp.array
+        for launch in tape.launches:
+            if isinstance(launch, list):
+                for arg in (*launch[3], *launch[4]):
+                    if type(arg) is array:  # the common case, inlined: what get_adjoint records for it
+                        if arg.grad is not None:
+                            gradients[arg] = arg.grad
+                    elif not _is_plain_value(arg):
+                        tape.get_adjoint(arg)  # structs (their array fields) and other arrays
+    tape.zero()
+
+
 def _torch_cuda(t) -> bool:
     return _convert.framework_of(t) == "torch" and t.is_cuda
 
@@ -220,11 +241,10 @@ def from_warp(
         # Outputs always own a .grad here, so Tape.backward copies the cotangents into it
         # instead of adopting the caller's arrays as .grad (which tape.zero() would then wipe).
         grads = {o: _convert.to_warp(c, dtype=o.dtype, device=o.device) for o, c in zip(outs, cts)}
-        tape.zero()
+        _zero_gradients(tape)
         tape.backward(grads=grads)
         # Clone: recorded adjoint launches keep pointing at these buffers, so a reuse of this
-        # residual (retain_graph) writes into them again. No trailing tape.zero(): every backward
-        # zeroes first, so clearing again here would only cost memsets.
+        # residual (retain_graph) writes into them again.
         return tuple(
             wp.clone(x.grad) if x.requires_grad and x.grad is not None else wp.zeros_like(x) for x in wxs
         )

@@ -471,3 +471,35 @@ def test_warp_residual_reused_by_retain_graph():
     out.sum().backward()
     torch.testing.assert_close(first, 2 * x.detach())
     torch.testing.assert_close(x.grad, 4 * x.detach())
+
+
+@wp.kernel
+def _accumulate_square(x: wp.array(dtype=wp.float64), acc: wp.array(dtype=wp.float64)):
+    i = wp.tid()
+    wp.atomic_add(acc, i, x[i] * x[i])
+
+
+_STATE = {}
+
+
+def _warp_fourth_power_through_state(x):
+    """x**4 through a buffer that lives across calls and is accumulated into, like a simulator's
+    forces: cleared by an unrecorded memset, then atomically added to. Unlike an overwriting
+    store, whose adjoint consumes the gradient, an atomic add's adjoint leaves ``acc.grad`` set."""
+    if "acc" not in _STATE:
+        _STATE["acc"] = wp.zeros(x.shape[0], dtype=wp.float64, device=x.device, requires_grad=True)
+    acc = _STATE["acc"]
+    acc.zero_()
+    wp.launch(_accumulate_square, dim=x.shape[0], inputs=[x], outputs=[acc], device=x.device)
+    return _warp_square(acc)
+
+
+@pytest.mark.parametrize("cache_residuals", [None, False])
+def test_warp_preallocated_buffers_do_not_carry_gradients_between_calls(cache_residuals):
+    """Each call's gradient is exact: a fresh tape's zero() alone would not clear ``acc.grad``."""
+    _STATE.clear()
+    f = gb.to_torch(gb.from_warp(_warp_fourth_power_through_state), cache_residuals=cache_residuals)
+    for _ in range(3):
+        x = torch.arange(1.0, 6.0, dtype=torch.float64, requires_grad=True)
+        f(x).sum().backward()
+        torch.testing.assert_close(x.grad, 4 * x.detach() ** 3, rtol=0, atol=0)
