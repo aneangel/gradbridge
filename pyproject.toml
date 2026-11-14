@@ -43,7 +43,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # Compiled on first use against the installed TensorFlow (see gradbridge/_tf_native.py).
-gradbridge = ["_tf_op.cc"]
+gradbridge = ["_tf_op.cc", "_jax_op.cc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -163,10 +163,34 @@ def _callback(dfn: DiffFunction, xs):
 
     # The FFI handler runs on CPU and CUDA alike, so no platform switch is needed (a lax switch
     # would also make side-effecting VJPs fail under vmap: "IO effect not supported in vmap-of-cond").
+    native_call = _native_callable(dfn, xs, result_shapes)
+    if native_call is not None:
+        return native_call(*xs)
     device_call = _gpu_callable(dfn, xs, result_shapes)
     if device_call is None:
         return host_call(*xs)
     return device_call(*xs)
+
+
+def _native_callable(dfn: DiffFunction, xs, result_shapes):
+    """gradbridge's own compiled XLA FFI handler (``_jax_op.cc``), or None to fall back."""
+    if dfn.batched or _warp_or_none() is None:
+        return None
+    from . import _jax_native
+
+    specs = [(tuple(x.shape), x.dtype) for x in xs] + [(tuple(r.shape), r.dtype) for r in result_shapes]
+    if not _jax_native.supported(specs):
+        return None
+    target = _jax_native.load()
+    if target is None:
+        return None
+    call = jax.ffi.ffi_call(target, result_shapes, vmap_method="sequential", has_side_effect=dfn.has_side_effects)
+    cid = np.int64(_jax_native.callback_id(dfn))
+
+    def native_call(*args):
+        return tuple(_as_tuple(call(*args, callback_id=cid)))
+
+    return native_call
 
 
 # =============================================================================
