@@ -443,17 +443,21 @@ def _eager_function(dfn: DiffFunction, cache_residuals: bool):
     class _Eager(torch.autograd.Function):
         @staticmethod
         def forward(ctx, *xs):
-            device = xs[0].device if xs else torch.device("cpu")
+            # Non-tensor arrays (e.g. a Warp array of constants) pass through unconverted: they
+            # are constants to autograd, and the source reads them in its own framework.
+            tensors = [x for x in xs if isinstance(x, torch.Tensor)]
+            device = tensors[0].device if tensors else torch.device("cpu")
             if cache_residuals:
                 outs, ctx.res = dfn.fwd(*xs)
             else:
                 outs, ctx.res = dfn.eval(*xs), None
-            ctx.save_for_backward(*xs)
+            ctx.save_for_backward(*tensors)
+            ctx.constants = [None if isinstance(x, torch.Tensor) else x for x in xs]
             out_t = []
             for o in outs:
                 t = _convert.to_torch(o, device=device)
                 # Same rule as the custom op: never hand out an alias of an input.
-                if any(_shares_storage(t, x) for x in xs):
+                if any(_shares_storage(t, x) for x in tensors):
                     t = t.clone()
                 out_t.append(t)
             ctx.out_meta = [(tuple(o.shape), o.dtype, o.device) for o in out_t]
@@ -461,19 +465,22 @@ def _eager_function(dfn: DiffFunction, cache_residuals: bool):
 
         @staticmethod
         def backward(ctx, *grads):
-            xs = ctx.saved_tensors
+            saved = iter(ctx.saved_tensors)
+            xs = [next(saved) if c is None else c for c in ctx.constants]
             cts = [
                 g if g is not None else torch.zeros(shape, dtype=dtype, device=device)
                 for g, (shape, dtype, device) in zip(grads, ctx.out_meta)
             ]
             if torch.is_grad_enabled():
                 # create_graph=True: need a differentiable backward, use the op path.
-                in_cts = _bridge(dfn.vjp_function).apply(*xs, *cts)
+                txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
+                in_cts = _bridge(dfn.vjp_function).apply(*txs, *cts)
             else:
                 raw = dfn.bwd(ctx.res, *cts) if ctx.res is not None else dfn.vjp_function.eval(*xs, *cts)
-                in_cts = [_convert.to_torch(c, device=x.device) for c, x in zip(raw, xs)]
+                in_cts = [_convert.to_torch(c, device=x.device) if isinstance(x, torch.Tensor) else None for c, x in zip(raw, xs)]
             return tuple(
-                c.to(x.dtype) if (x.is_floating_point() or x.is_complex()) else None for c, x in zip(in_cts, xs)
+                c.to(x.dtype) if isinstance(x, torch.Tensor) and (x.is_floating_point() or x.is_complex()) else None
+                for c, x in zip(in_cts, xs)
             )
 
     _Eager.__name__ = f"Eager_{_sanitize(dfn.name)}"
@@ -523,12 +530,16 @@ def to_torch(fn, *, cache_residuals: Optional[bool] = None) -> Callable:
     native = dfn._torch_native
 
     def wrapper(*xs):
+        if native is None and _eager_ok():
+            # Eager: arrays from other frameworks are constants to autograd; skip the round trip.
+            outs = tuple(eager.apply(*xs))
+            return outs[0] if len(outs) == 1 else outs
         txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
         if native is not None:
             # A PyTorch source called from PyTorch needs no bridge: its own graph is the gradient.
             outs = _as_tuple(native(*txs))
         else:
-            outs = tuple((eager if _eager_ok() else bridge).apply(*txs))
+            outs = tuple(bridge.apply(*txs))
         return outs[0] if len(outs) == 1 else outs
 
     functools.update_wrapper(wrapper, dfn._eval, assigned=("__doc__",), updated=())
