@@ -28,6 +28,7 @@ jobs:
         run: |
           python -m twine check --strict dist/*
           python -m zipfile -l dist/*.whl | grep -q "gradbridge/_tf_op.cc"
+          python -m zipfile -l dist/*.whl | grep -q "gradbridge/_jax_op.cc"
       - uses: actions/upload-artifact@v7
         with:
           name: dist

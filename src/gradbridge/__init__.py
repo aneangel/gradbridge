@@ -20,7 +20,7 @@ from ._check import CompareReport, GradcheckReport, compare, gradcheck
 from ._convert import HostCopyWarning
 from ._core import DiffFunction, MaxOrderError, Spec, as_diff_function
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DiffFunction",
