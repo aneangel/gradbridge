@@ -503,3 +503,16 @@ def test_warp_preallocated_buffers_do_not_carry_gradients_between_calls(cache_re
         x = torch.arange(1.0, 6.0, dtype=torch.float64, requires_grad=True)
         f(x).sum().backward()
         torch.testing.assert_close(x.grad, 4 * x.detach() ** 3, rtol=0, atol=0)
+
+
+def test_warp_inference_invalidates_pending_residual():
+    """A no-grad call can overwrite the simulator state a pending backward still needs."""
+    _STATE.clear()
+    f = gb.to_torch(gb.from_warp(_warp_fourth_power_through_state))
+    x = torch.arange(1.0, 6.0, dtype=torch.float64, requires_grad=True)
+    out = f(x)
+    with torch.no_grad():
+        prediction = f(x + 3)
+    torch.testing.assert_close(prediction, (x.detach() + 3) ** 4, rtol=0, atol=0)
+    out.sum().backward()
+    torch.testing.assert_close(x.grad, 4 * x.detach() ** 3, rtol=0, atol=0)

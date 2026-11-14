@@ -108,6 +108,40 @@ def _dlpack_ok(x) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def _capsule_device_reader():
+    import ctypes
+
+    # An unversioned DLManagedTensor begins with DLTensor.data followed by DLDevice.
+    # Read the capsule, since EagerPyFunc can report CPU placement for a GPU allocation.
+    get_pointer = ctypes.PYFUNCTYPE(ctypes.c_void_p, ctypes.py_object, ctypes.c_char_p)(
+        ("PyCapsule_GetPointer", ctypes.pythonapi)
+    )
+    device_type = ctypes.c_int * 2
+    offset = ctypes.sizeof(ctypes.c_void_p)
+
+    def read(capsule):
+        return tuple(device_type.from_address(get_pointer(capsule, b"dltensor") + offset))
+
+    return read
+
+
+class _TensorFlowDLPack:
+    """Adapt TensorFlow's finished capsule to the DLPack object protocol JAX requires."""
+
+    def __init__(self, tensor):
+        import tensorflow as tf
+
+        self.capsule = tf.experimental.dlpack.to_dlpack(tensor)
+
+    def __dlpack_device__(self):
+        return _capsule_device_reader()(self.capsule)
+
+    def __dlpack__(self, stream=None, **kwargs):
+        # TensorFlow's export already waited for its producer, so no stream handshake is needed.
+        return self.capsule
+
+
 # ----------------------------------------------------------------------------- torch <-> warp streams
 # Torch <-> Warp conversions order the two frameworks' CUDA streams with one event wait instead
 # of a DLPack capsule handshake per tensor (several times cheaper; same ordering guarantee).
@@ -316,6 +350,12 @@ def to_jax(x, dtype=None):
 
     if framework_of(x) == "jax":
         a = x
+    elif framework_of(x) == "tensorflow":
+        try:
+            a = jax.dlpack.from_dlpack(_TensorFlowDLPack(x))
+        except Exception as e:  # pragma: no cover - depends on dtype/device
+            _warn_host_copy("tensorflow", "jax", e)
+            a = jnp.asarray(to_numpy(x))
     else:
         a = None
         if framework_of(x) == "torch":
@@ -435,7 +475,7 @@ def to_warp(x, dtype=None, requires_grad=False, device=None):
 
     fw = framework_of(x)
     if fw == "warp" and not requires_grad and (dtype is None or x.dtype == dtype):
-        return x
+        return x if device is None else x.to(device)
     if fw == "torch" and x.is_cuda:
         src = x.detach()
         if not src.is_contiguous():
@@ -447,8 +487,7 @@ def to_warp(x, dtype=None, requires_grad=False, device=None):
         if requires_grad:
             a.requires_grad = True
         return a
-    tf_on_gpu = fw == "tensorflow" and "GPU" in x.device
-    if (fw in ("torch", "jax", "warp") or tf_on_gpu) and not _is_float0(x):
+    if fw in ("torch", "jax", "warp", "tensorflow") and not _is_float0(x):
         src = x
         if fw == "torch":
             src = x.detach()

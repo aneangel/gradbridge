@@ -127,6 +127,22 @@ def test_eval_without_grad_replays_the_graph():
         assert torch.equal(graphed(_x(7)), eager(_x(7)))
 
 
+def test_inference_between_forward_and_backward(replays):
+    """Inference replays the graph and invalidates the pending training residual."""
+    eager, graphed = _pair()
+    for i in range(2):
+        _value_and_grad(graphed, _x(i), _x(1))
+    ref = _value_and_grad(eager, _x(2), _x(4))[1]
+    x = _x(2).requires_grad_(True)
+    out = graphed(x)
+    before = replays[0]
+    with torch.no_grad():
+        graphed(_x(7))
+    assert replays[0] == before + 1
+    (out * _x(4)).sum().backward()
+    assert torch.equal(x.grad, ref)
+
+
 def test_new_shape_gets_its_own_graph():
     eager, graphed = _pair()
     for n in (64, 64, 64, 300, 300, 300, 64):

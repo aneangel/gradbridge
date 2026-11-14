@@ -1,7 +1,7 @@
 // gradbridge's TensorFlow op: calls a Python function on TensorFlow's own device buffers.
 //
-// tf.py_function always runs on the host, so TensorFlow copies GPU inputs to the CPU and the
-// results back. GradbridgeCall has CPU and GPU kernels: TensorFlow allocates the outputs, and the
+// The Python fallback uses DLPack; this handler avoids its conversion overhead and host waits
+// for PyTorch sources. GradbridgeCall has CPU and GPU kernels: TensorFlow allocates the outputs, and the
 // kernel hands raw input/output pointers plus TensorFlow's CUDA stream to a callback registered
 // from Python (a ctypes function, which takes the GIL itself). No Python headers are needed.
 //

@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install "jax[cpu]" tensorflow-cpu warp-lang pytest
-          pip install -e .
+          pip install -e ".[downstream]"
       - name: Test (unexpected host copies are errors)
         env:
           GRADBRIDGE_CACHE_DIR: ${{ runner.temp }}/gradbridge-cache

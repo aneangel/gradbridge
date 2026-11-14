@@ -9,6 +9,7 @@ fake-tensor kernel and vmap rule) wrapped in a ``torch.autograd.Function``
 (with ``setup_context`` and a generated vmap rule). That makes it work with
 ``loss.backward()``, double backward (``create_graph=True``), ``torch.func.grad``
 / ``torch.func.vmap`` and ``torch.compile(fullgraph=True)``.
+Forward mode uses the source's JVP rule for ``torch.func.jvp`` / ``jacfwd``.
 """
 
 from __future__ import annotations
@@ -21,12 +22,10 @@ import sys
 import threading
 from typing import Callable, Optional
 
-import numpy as np
-
 # torch.library custom ops lazily import torch._dynamo, which loads Triton's
 # bundled LLVM. If TensorFlow (which bundles its own LLVM) is already loaded,
-# that import aborts the whole process. Load it now, or fail with an
-# explanation instead of a crash.
+# some binary combinations abort the whole process. Load it now, or keep the
+# conservative import guard until those combinations have a compatibility matrix.
 if (
     "tensorflow" in sys.modules
     and "torch._dynamo" not in sys.modules
@@ -34,12 +33,13 @@ if (
 ):
     raise ImportError(
         "gradbridge.torch must be imported before TensorFlow when Triton is installed: "
-        "TensorFlow and Triton bundle conflicting LLVM builds and the process would abort. "
+        "Some TensorFlow and Triton binaries bundle conflicting LLVM builds; this import guard is conservative. "
         "Import gradbridge.torch (or torch._dynamo) first, then tensorflow."
     )
 
 import torch
 import torch._dynamo  # noqa: F401  (see note above)
+from torch._functorch import eager_transforms as _transforms
 
 from . import _convert
 from ._core import DiffFunction, MaxOrderError, Spec, _as_tuple, as_diff_function, infer_n_inputs, split_primals
@@ -244,12 +244,15 @@ def _make(fn_t: Callable, *, name, framework="torch", n_inputs=None, n_outputs=N
         return tangents_out
 
     def _vjp_factory():
-        vjp = _make(vjp_body, name=f"{name}_vjp", framework=framework, n_outputs=dfn.n_inputs, device=device)
+        vjp = _make(
+            vjp_body, name=f"{name}_vjp", framework=framework, n_outputs=dfn.n_inputs,
+            batched=batched, device=device,
+        )
         vjp.has_side_effects = True  # accumulates into captured parameters' .grad
         return vjp
 
     dfn._vjp_factory = _vjp_factory
-    dfn._jvp_factory = lambda: _make(jvp_body, name=f"{name}_jvp", framework=framework, device=device)
+    dfn._jvp_factory = lambda: _make(jvp_body, name=f"{name}_jvp", framework=framework, batched=batched, device=device)
     return dfn
 
 
@@ -368,10 +371,20 @@ _BRIDGE_REGISTRY: dict = {}
 
 
 def _eager_vjp(key, xs, cts):
-    return _bridge(_BRIDGE_REGISTRY[key].vjp_function).apply(*xs, *cts)
+    return _bridge(_BRIDGE_REGISTRY[key].vjp_function, forward_mode=True).apply(*xs, *cts)
 
 
-def _bridge(dfn: DiffFunction):
+def _eager_jvp(dfn, xs, tangents, out_meta):
+    txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
+    ts = [t if t is not None else torch.zeros_like(x) for x, t in zip(txs, tangents)]
+    outs = _bridge(dfn.jvp_function, forward_mode=True).apply(*txs, *ts)
+    return tuple(
+        t.to(dtype=dtype, device=device) if dtype.is_floating_point or dtype.is_complex else None
+        for t, (_, dtype, device) in zip(outs, out_meta)
+    )
+
+
+def _bridge(dfn: DiffFunction, *, forward_mode=False):
     """autograd.Function around the custom op.
 
     The custom op is the opaque compute (fake-tensor + vmap rules, so
@@ -380,8 +393,9 @@ def _bridge(dfn: DiffFunction):
     is what ``torch.func.grad`` / ``vmap(grad(...))`` and double backward need.
     """
     cache = dfn._consumer_cache
-    if "torch_bridge" in cache:
-        return cache["torch_bridge"]
+    cache_key = "torch_forward_bridge" if forward_mode else "torch_bridge"
+    if cache_key in cache:
+        return cache[cache_key]
     # The autograd.Function's methods must not close over Python objects Dynamo
     # cannot wrap (like the DiffFunction): use an int key + module registry.
     key = id(dfn)
@@ -423,9 +437,25 @@ def _bridge(dfn: DiffFunction):
                 c.to(x.dtype) if (x.is_floating_point() or x.is_complex()) else None for c, x in zip(in_cts, xs)
             )
 
-    _Bridge.__name__ = f"Bridge_{_sanitize(name)}"
-    cache["torch_bridge"] = _Bridge
-    return _Bridge
+    if forward_mode:
+        # Dynamo rejects autograd.Function classes with a custom JVP, even when only
+        # reverse mode is requested. Keep that method on the eager/torch.func class.
+        class _ForwardBridge(_Bridge):
+            @staticmethod
+            def setup_context(ctx, inputs, output):
+                _Bridge.setup_context(ctx, inputs, output)
+                ctx.save_for_forward(*inputs)
+
+            @staticmethod
+            def jvp(ctx, *tangents):
+                return _eager_jvp(_BRIDGE_REGISTRY[key], ctx.saved_tensors, tangents, ctx.out_meta)
+
+        bridge = _ForwardBridge
+    else:
+        bridge = _Bridge
+    bridge.__name__ = f"Bridge_{_sanitize(name)}"
+    cache[cache_key] = bridge
+    return bridge
 
 
 def _eager_function(dfn: DiffFunction, cache_residuals: bool):
@@ -452,6 +482,7 @@ def _eager_function(dfn: DiffFunction, cache_residuals: bool):
             else:
                 outs, ctx.res = dfn.eval(*xs), None
             ctx.save_for_backward(*tensors)
+            ctx.save_for_forward(*tensors)
             ctx.constants = [None if isinstance(x, torch.Tensor) else x for x in xs]
             out_t = []
             for o in outs:
@@ -464,6 +495,12 @@ def _eager_function(dfn: DiffFunction, cache_residuals: bool):
             return tuple(out_t)
 
         @staticmethod
+        def jvp(ctx, *tangents):
+            saved = iter(ctx.saved_tensors)
+            xs = [next(saved) if c is None else c for c in ctx.constants]
+            return _eager_jvp(dfn, xs, tangents, ctx.out_meta)
+
+        @staticmethod
         def backward(ctx, *grads):
             saved = iter(ctx.saved_tensors)
             xs = [next(saved) if c is None else c for c in ctx.constants]
@@ -474,7 +511,7 @@ def _eager_function(dfn: DiffFunction, cache_residuals: bool):
             if torch.is_grad_enabled():
                 # create_graph=True: need a differentiable backward, use the op path.
                 txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
-                in_cts = _bridge(dfn.vjp_function).apply(*txs, *cts)
+                in_cts = _bridge(dfn.vjp_function, forward_mode=True).apply(*txs, *cts)
             else:
                 raw = dfn.bwd(ctx.res, *cts) if ctx.res is not None else dfn.vjp_function.eval(*xs, *cts)
                 in_cts = [_convert.to_torch(c, device=x.device) if isinstance(x, torch.Tensor) else None for c, x in zip(raw, xs)]
@@ -510,7 +547,10 @@ def to_torch(fn, *, cache_residuals: Optional[bool] = None) -> Callable:
 
     In plain eager mode the call goes straight to the source; under
     ``torch.compile`` or a ``torch.func`` transform it goes through a custom op
-    those systems can trace.
+    those systems can trace. Forward mode (``torch.func.jvp``, ``jacfwd`` and
+    ``torch.autograd.forward_ad``) uses the source's JVP rule, when available.
+    Compile the complete JVP / forward-Jacobian transform to call the source's
+    JVP as a custom op. Nested compiled JVPs are not supported.
 
     ``cache_residuals`` (eager mode only) controls whether the source's forward
     state is kept for backward instead of recomputing the forward. The default,
@@ -519,27 +559,57 @@ def to_torch(fn, *, cache_residuals: Optional[bool] = None) -> Callable:
     any of it before ``backward()`` (e.g. several rollouts of one simulator), the
     earlier backward recomputes its forward first, so gradients stay exact. What
     it cannot see is your own code writing into those buffers between forward and
-    backward -- pass ``False`` to always recompute if you do that.
+    backward -- call ``invalidate_warp_residuals`` after external writes, or pass
+    ``False`` to always recompute when those writes cannot be annotated.
+    Calls without reverse-mode gradients (including ``torch.no_grad()``) skip
+    building the source's backward state.
     """
     dfn = as_diff_function(fn)
     op = _custom_op(dfn)
+    primal_overload = op.overload
+    jvp_overload = _custom_op(dfn.jvp_function).overload if dfn.has_jvp else None
     bridge = _bridge(dfn)
+    forward_bridge = _bridge(dfn, forward_mode=True)
     cache = dfn.framework in _SAFE_TO_CACHE if cache_residuals is None else bool(cache_residuals)
     eager = _eager_function(dfn, cache)
+    eval_only = _eager_function(dfn, False)
 
     native = dfn._torch_native
+    name = dfn.name
 
     def wrapper(*xs):
         if native is None and _eager_ok():
             # Eager: arrays from other frameworks are constants to autograd; skip the round trip.
-            outs = tuple(eager.apply(*xs))
+            needs_grad = torch.is_grad_enabled() and any(isinstance(x, torch.Tensor) and x.requires_grad for x in xs)
+            outs = tuple((eager if needs_grad else eval_only).apply(*xs))
             return outs[0] if len(outs) == 1 else outs
         txs = [x if isinstance(x, torch.Tensor) else _convert.to_torch(x) for x in xs]
         if native is not None:
             # A PyTorch source called from PyTorch needs no bridge: its own graph is the gradient.
             outs = _as_tuple(native(*txs))
+        elif torch.compiler.is_compiling():
+            # A custom autograd.Function with a JVP is rejected by Dynamo. Unpack the
+            # duals explicitly so the graph contains ordinary primal and tangent ops.
+            duals = [torch.autograd.forward_ad.unpack_dual(x) for x in txs]
+            if any(t is not None for _, t in duals):
+                if _transforms.JVP_NESTING > 1:
+                    raise MaxOrderError("gradbridge: compiled nested forward-mode transforms are not supported")
+                if jvp_overload is None:
+                    raise MaxOrderError(f"gradbridge: '{name}' has no forward-mode (JVP) rule")
+                primals = [p for p, _ in duals]
+                tangents = [t if t is not None else torch.zeros_like(p) for p, t in duals]
+                prim_outs = primal_overload(primals)
+                t_outs = jvp_overload(primals + tangents)
+                outs = tuple(
+                    torch.autograd.forward_ad.make_dual(o, t.to(dtype=o.dtype, device=o.device))
+                    if o.is_floating_point() or o.is_complex()
+                    else o
+                    for o, t in zip(prim_outs, t_outs)
+                )
+            else:
+                outs = tuple(bridge.apply(*txs))
         else:
-            outs = tuple(bridge.apply(*txs))
+            outs = tuple(forward_bridge.apply(*txs))
         return outs[0] if len(outs) == 1 else outs
 
     functools.update_wrapper(wrapper, dfn._eval, assigned=("__doc__",), updated=())

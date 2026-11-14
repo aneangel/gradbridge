@@ -10,12 +10,11 @@ callback into the foreign framework (see below). It works under ``jax.jit``, ``j
 ``jax.custom_jvp`` instead, enabling forward mode (``jax.jvp``, ``jax.jacfwd``)
 but not reverse mode -- JAX cannot transpose an opaque callback.
 
-With Warp installed, the callback is an XLA FFI handler built with Warp's
-``jax_callable`` (CPU and CUDA): the foreign function receives XLA's buffers
-zero-copy, ordered on XLA's stream on GPU. A JAX source is composed directly, with no
-callback. Otherwise -- no Warp, natively batched sources, 0-d or >4-d arrays,
-dtypes Warp has no scalar type for -- ``jax.pure_callback`` is used (or
-``io_callback`` for side-effecting VJPs), which copies device -> host -> device.
+The compiled XLA FFI handler passes CPU/CUDA buffers directly to PyTorch sources,
+including scalar, high-rank and batched arrays. Other sources use Warp arrays through
+that handler or Warp's ``jax_callable``. A JAX source is composed directly. Unsupported
+signatures use ``jax.pure_callback`` (or ``io_callback`` for side-effecting VJPs), which
+copies device -> host -> device.
 """
 
 from __future__ import annotations
@@ -174,17 +173,20 @@ def _callback(dfn: DiffFunction, xs):
 
 def _native_callable(dfn: DiffFunction, xs, result_shapes):
     """gradbridge's own compiled XLA FFI handler (``_jax_op.cc``), or None to fall back."""
-    if dfn.batched or _warp_or_none() is None:
+    if dfn.framework != "torch" and (dfn.batched or _warp_or_none() is None):
         return None
     from . import _jax_native
 
     specs = [(tuple(x.shape), x.dtype) for x in xs] + [(tuple(r.shape), r.dtype) for r in result_shapes]
-    if not _jax_native.supported(specs):
+    if not _jax_native.supported(specs, framework=dfn.framework):
         return None
     target = _jax_native.load()
     if target is None:
         return None
-    call = jax.ffi.ffi_call(target, result_shapes, vmap_method="sequential", has_side_effect=dfn.has_side_effects)
+    call = jax.ffi.ffi_call(
+        target, result_shapes, vmap_method="broadcast_all" if dfn.batched else "sequential",
+        has_side_effect=dfn.has_side_effects,
+    )
     cid = np.int64(_jax_native.callback_id(dfn))
 
     def native_call(*args):

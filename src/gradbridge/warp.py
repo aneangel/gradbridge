@@ -23,7 +23,7 @@ import warp as wp
 from . import _convert
 from ._core import DiffFunction, _as_tuple, as_diff_function, infer_n_inputs, split_primals
 
-__all__ = ["from_warp", "to_warp"]
+__all__ = ["from_warp", "to_warp", "invalidate_residuals"]
 
 _FIRST_ORDER_ONLY = "Warp's Tape computes first-order adjoints only (no gradient-of-gradient)"
 
@@ -174,7 +174,7 @@ def _overlaps(a, b) -> bool:
     return bool(np.any(ahi[idx[valid]] > blo[valid]))
 
 
-def _invalidate(new, everything=False):
+def _invalidate(new, everything=False, *, ranges=_UNSET):
     """Mark live residuals that ``new`` (a _Residual) may have overwritten stale.
 
     ``everything=True`` marks them all, for calls whose touched memory is unknown.
@@ -185,9 +185,32 @@ def _invalidate(new, everything=False):
         if res is None:
             continue
         alive.append(ref)
-        if res is not new and not res.stale and (everything or _overlaps(res.ranges, new.ranges)):
+        if res is not new and not res.stale and (
+            everything or _overlaps(res.ranges, new.ranges if ranges is _UNSET else ranges)
+        ):
             res.stale = True
     _LIVE_RESIDUALS[:] = alive
+
+
+def invalidate_residuals(*arrays):
+    """Notify gradbridge of writes to Warp buffers outside a bridged call.
+
+    Call after modifying the arrays and before backward. Only cached tapes that
+    touched those arrays are invalidated; their backward recomputes the forward.
+    With no arguments, invalidate all cached Warp tapes. This inspects addresses
+    only: it does not copy arrays or synchronize the GPU. The forward must rebuild
+    intermediates from its saved inputs; changing hidden model inputs is not a
+    reproducible recomputation.
+    """
+    if not arrays:
+        _invalidate(None, everything=True)
+        return
+    if any(not isinstance(a, wp.array) for a in arrays):
+        raise TypeError("invalidate_residuals expects Warp arrays")
+    bounds = [(a.ptr, a.ptr + max(a.capacity, 1)) for a in arrays if a.ptr]
+    lo = np.asarray([b[0] for b in bounds], dtype=np.uint64)
+    hi = np.asarray([b[1] for b in bounds], dtype=np.uint64)
+    _invalidate(None, ranges=(lo, hi))
 
 
 def _zero_gradients(tape):

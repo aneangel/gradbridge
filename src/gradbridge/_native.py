@@ -4,7 +4,7 @@ Each handler is a small C++ library compiled on first use against the installed 
 cached under ``~/.cache/gradbridge`` (``GRADBRIDGE_CACHE_DIR`` overrides; ``CXX`` overrides
 ``g++``). The C++ side reads the framework's own buffers and CUDA stream and calls one registered
 Python callback with raw pointers; :class:`NativeBridge` wraps them (as PyTorch tensors for a
-PyTorch source on CUDA, as Warp arrays otherwise), runs the bridged function ordered on that
+PyTorch source, as Warp arrays otherwise), runs the bridged function ordered on that
 stream, and copies the results into the framework's outputs.
 """
 
@@ -79,9 +79,10 @@ class NativeBridge:
     """Registry and Python side of one compiled handler. ``dtypes`` maps the framework's dtype
     codes to NumPy dtype names."""
 
-    def __init__(self, name: str, dtypes: dict):
+    def __init__(self, name: str, dtypes: dict, *, fallback_warning=_convert.HostCopyWarning):
         self.name = name
         self.dtypes = dtypes
+        self.fallback_warning = fallback_warning
         self.lock = threading.Lock()
         self.tried = False
         self.handle = None  # whatever the loader returns (op module, registered target, ...)
@@ -106,7 +107,7 @@ class NativeBridge:
                 warnings.warn(
                     f"gradbridge: could not build the {self.name} handler, so it falls back to a slower "
                     f"path ({type(e).__name__}: {str(e)[:300]})",
-                    _convert.HostCopyWarning,
+                    self.fallback_warning,
                     stacklevel=4,
                 )
             self.tried = True
@@ -122,10 +123,13 @@ class NativeBridge:
             cache[key] = cid
         return cache[key]
 
-    def supported(self, specs) -> bool:
-        """Warp arrays need 1-4 dimensions and a Warp scalar dtype; anything else uses a fallback."""
+    def supported(self, specs, *, framework=None) -> bool:
+        """PyTorch views support any rank; the Warp-based path needs 1-4 dimensions."""
         names = set(self.dtypes.values())
-        return all(1 <= len(shape) <= 4 and np.dtype(dtype).name in names for shape, dtype in specs)
+        return all(
+            (framework == "torch" or 1 <= len(shape) <= 4) and np.dtype(dtype).name in names
+            for shape, dtype in specs
+        )
 
     def raise_pending(self):
         """Re-raise the bridged function's own exception (instead of the framework's error)."""
@@ -168,13 +172,31 @@ class NativeBridge:
                 view = torch.as_tensor(_CudaBuffer(ptr, shape, dtype), device=f"cuda:{ordinal}")
                 view.copy_(res.reshape(shape) if tuple(res.shape) != shape else res)
 
+    def _torch_cpu_call(self, dfn, ins, outs):
+        """Borrow the caller's CPU buffers as NumPy/PyTorch views, including scalars and empty arrays."""
+        import torch
+
+        def view(ptr, shape, dtype):
+            size = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+            buffer = (ctypes.c_ubyte * size).from_address(ptr)
+            return np.ndarray(shape, dtype=dtype, buffer=buffer)
+
+        inputs = [torch.from_numpy(view(*b)) for b in ins]
+        results = dfn.eval(*inputs)
+        for b, res in zip(outs, results):
+            dst = view(*b)
+            np.copyto(dst, res.detach().cpu().numpy().reshape(dst.shape), casting="unsafe")
+
     def _callback(self, cid, n_in, in_ptrs, in_dims, in_ranks, in_dtypes, n_out, out_ptrs, out_dims, out_ranks, out_dtypes, stream, ordinal):
         try:
             dfn = self._registry[cid]
-            if stream and dfn.framework == "torch":
+            if dfn.framework == "torch":
                 ins = self._buffers(n_in, in_ptrs, in_dims, in_ranks, in_dtypes)
                 outs = self._buffers(n_out, out_ptrs, out_dims, out_ranks, out_dtypes)
-                self._torch_call(dfn, ins, outs, stream, ordinal)
+                if ordinal >= 0:
+                    self._torch_call(dfn, ins, outs, stream, ordinal)
+                else:
+                    self._torch_cpu_call(dfn, ins, outs)
                 return 0
 
             import warp as wp

@@ -616,8 +616,8 @@ def test_jax_ffi_large_output_exact():
         assert bool(jnp.array_equal(out, x + 1.0))
 
 
-def test_jax_consumer_scalar_output_falls_back(dtype):
-    """Warp arrays cannot be 0-d, so a scalar output takes the pure_callback path, still correct."""
+def test_jax_consumer_scalar_output_uses_native_buffers(dtype):
+    """A scalar output from PyTorch stays on the native path, including its reverse-mode rule."""
     require_gpu("torch", "jax")
     f = gb.to_jax(gb.from_torch(lambda t: (t**2).sum()))
     x = jax.device_put(np.linspace(0.1, 1.0, 5).astype(dtype), gpu_device())

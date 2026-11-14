@@ -20,7 +20,7 @@ from ._check import CompareReport, GradcheckReport, compare, gradcheck
 from ._convert import HostCopyWarning
 from ._core import DiffFunction, MaxOrderError, Spec, as_diff_function
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "DiffFunction",
@@ -38,6 +38,7 @@ __all__ = [
     "to_tf",
     "to_numpy",
     "to_warp",
+    "invalidate_warp_residuals",
     "convert",
     "gradcheck",
     "compare",
@@ -114,6 +115,13 @@ def to_warp(fn, **kwargs):
     from .warp import to_warp as _f
 
     return _f(fn, **kwargs)
+
+
+def invalidate_warp_residuals(*arrays):
+    """Notify gradbridge of external Warp buffer writes. See :func:`gradbridge.warp.invalidate_residuals`."""
+    from .warp import invalidate_residuals
+
+    invalidate_residuals(*arrays)
 
 
 _SOURCES = {"torch": from_torch, "jax": from_jax, "tf": from_tf, "tensorflow": from_tf, "numpy": from_numpy, "warp": from_warp}

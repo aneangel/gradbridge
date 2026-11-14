@@ -7,11 +7,13 @@ with ``tf.GradientTape`` (nested tapes give higher orders) and whose JVP uses
 ``to_tf`` exposes any DiffFunction to TensorFlow via ``tf.custom_gradient``
 around gradbridge's ``GradbridgeCall`` op, which hands the foreign function
 TensorFlow's own (GPU) buffers zero-copy; it is compiled on first use (see
-``_tf_native.py``). Without a C++ compiler, or for 0-d / >4-d arrays and
-unsupported dtypes, ``tf.py_function`` is used instead, which runs on the host.
+``_tf_native.py``). Without a C++ compiler, or for unsupported native signatures,
+``tf.py_function`` exchanges supported GPU buffers through DLPack. PyTorch sources
+support arbitrary tensor rank in the native handler.
 A TensorFlow source is composed directly. It works eagerly, inside
 ``tf.function`` (with static input shapes), under nested ``GradientTape``s and
-``tf.map_fn``. It does not work under XLA (``jit_compile=True``).
+``tf.map_fn``. The callback path does not support XLA. With ``native=True``, an
+exportable JAX source lowers to a native TensorFlow graph that supports XLA.
 ``tf.vectorized_map`` evaluates it (via TF's loop fallback) but TensorFlow
 cannot backpropagate through that fallback -- use ``tf.map_fn`` for gradients.
 """
@@ -23,10 +25,8 @@ import importlib.util
 import sys
 from typing import Callable, Optional
 
-import numpy as np
-
 # If PyTorch is in use, load torch._dynamo (and Triton's LLVM) before
-# TensorFlow's LLVM, otherwise later PyTorch custom ops abort the process.
+# TensorFlow's LLVM; some binary combinations otherwise abort on later custom ops.
 if "tensorflow" not in sys.modules and "torch" in sys.modules and importlib.util.find_spec("triton") is not None:
     import torch._dynamo  # noqa: F401
 
@@ -39,6 +39,7 @@ from ._core import DiffFunction, Spec, _as_tuple, as_diff_function, infer_n_inpu
 __all__ = ["from_tf", "to_tf"]
 
 _ZERO = tf.UnconnectedGradients.ZERO
+_HAS_WARP = importlib.util.find_spec("warp") is not None
 
 
 def _is_float(t) -> bool:
@@ -165,15 +166,17 @@ def _wrapped(dfn: DiffFunction):
         in_specs = [Spec(tuple(x.shape), x.dtype.as_numpy_dtype) for x in xs]
         out_specs = dfn.spec(*in_specs)
 
-        def host(*args):
-            outs = dfn.eval(*[a.numpy() for a in args])
-            return [
-                np.asarray(_convert.to_numpy(o), dtype=s.dtype).reshape(s.shape) for o, s in zip(outs, out_specs)
-            ]
+        def callback(*args):
+            # EagerPyFunc can carry GPU allocations even when its input tensors report CPU
+            # placement. The source conversions inspect DLPack instead of forcing a host copy.
+            outs = dfn.eval(*args)
+            return [tf.reshape(_convert.to_tf(o, dtype=tf.as_dtype(s.dtype)), s.shape)
+                    for o, s in zip(outs, out_specs)]
 
         tout = [tf.as_dtype(s.dtype) for s in out_specs]
         specs = [(s.shape, s.dtype) for s in in_specs + list(out_specs)]
-        op = _tf_op.load() if _tf_op.supported(specs) else None
+        use_native = dfn.framework == "torch" or _HAS_WARP
+        op = _tf_op.load() if use_native and _tf_op.supported(specs, framework=dfn.framework) else None
         if op is not None:
             # TensorFlow's own buffers and stream, zero-copy (see _tf_native.py).
             try:
@@ -187,7 +190,7 @@ def _wrapped(dfn: DiffFunction):
                 _tf_op.raise_pending()
                 raise
         else:
-            outs = tf.py_function(host, inp=list(xs), Tout=tout)
+            outs = tf.py_function(callback, inp=list(xs), Tout=tout)
         outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
         for o, s in zip(outs, out_specs):
             o.set_shape(s.shape)
@@ -203,16 +206,33 @@ def _wrapped(dfn: DiffFunction):
     return f
 
 
-def to_tf(fn) -> Callable:
-    """Expose any gradbridge function to TensorFlow (``GradientTape`` gradients)."""
+def to_tf(fn, *, native: bool = False) -> Callable:
+    """Expose any gradbridge function to TensorFlow (``GradientTape`` gradients).
+
+    ``native=True`` exports a JAX source as a native TensorFlow graph through
+    ``jax2tf``. It supports ``jit_compile=True`` for exportable functions and
+    compatible JAX/TensorFlow versions, without a Python callback at execution.
+    TensorFlow sources already compose natively. Other sources use the callback
+    path and cannot request native graph lowering.
+    """
     dfn = as_diff_function(fn)
-    f = _wrapped(dfn)
-    native = dfn._tf_native
+    lowered = dfn._tf_native
+    if native and lowered is None:
+        if dfn._jax_native is None:
+            raise ValueError("native TensorFlow graph lowering requires a JAX or TensorFlow source")
+        cache = dfn._consumer_cache
+        if "tf_jax2tf" not in cache:
+            from jax.experimental import jax2tf
+
+            cache["tf_jax2tf"] = jax2tf.convert(
+                dfn._jax_native, native_serialization_platforms=("cpu", "cuda")
+            )
+        lowered = cache["tf_jax2tf"]
+    f = _wrapped(dfn) if lowered is None else None
 
     def wrapper(*xs):
-        if native is not None:
-            # A TensorFlow source called from TensorFlow needs no bridge: compose it directly.
-            outs = _as_tuple(native(*[x if isinstance(x, (tf.Tensor, tf.Variable)) else _convert.to_tf(x) for x in xs]))
+        if lowered is not None:
+            outs = _as_tuple(lowered(*[x if isinstance(x, (tf.Tensor, tf.Variable)) else _convert.to_tf(x) for x in xs]))
             return outs[0] if len(outs) == 1 else outs
         outs = f(*[x if isinstance(x, (tf.Tensor, tf.Variable)) else _convert.to_tf(x) for x in xs])
         return outs if not isinstance(outs, (list, tuple)) or len(outs) != 1 else outs[0]
