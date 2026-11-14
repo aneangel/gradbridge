@@ -48,6 +48,8 @@ More complete examples:
 
 - **Bridge coarse functions.** Each call costs a few tenths of a millisecond and nothing fuses
   across the boundary: wrap a simulator rollout, a model or a loss, not single operations.
+- **Inside a JAX hot loop, prefer Warp's own `jax_kernel` for single Warp kernels.** gradbridge
+  runs your function in a callback (~0.5 ms per gradient step); `jax_kernel` runs inside XLA.
 - **NumPy functions run on the host**, so their inputs and outputs are copied off the GPU.
 - **Calling other frameworks from TensorFlow needs a C++ compiler** for zero-copy; without one,
   gradbridge warns once and falls back to `tf.py_function` (host copies).

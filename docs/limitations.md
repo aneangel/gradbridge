@@ -11,6 +11,11 @@
 - **Some zero-copy handoffs wait on the host** instead of copying: TensorFlow only exports
   finished tensors and imports without a stream handshake, and the JAX and TensorFlow consumer
   callbacks wait for their framework's stream before returning.
+- **Warp kernels called from JAX in a hot loop.** gradbridge calls your Warp *function* (with
+  its tape) from an XLA callback, about 0.5–0.9 ms per jitted gradient step. Warp's own
+  `wp.jax_kernel` launches a single kernel from inside XLA in about 0.09 ms. When the work is one
+  Warp kernel whose outputs have the shape of its launch grid, use `jax_kernel` for the JAX side;
+  gradbridge is the better fit for whole functions, other source frameworks, and PyTorch callers.
 
 ## Data movement
 
